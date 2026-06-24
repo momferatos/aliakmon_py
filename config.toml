@@ -1,0 +1,43 @@
+# ALIAKMON_py configuration — hydro-only translation of aliakmon.nml
+# TOML mirrors the original Fortran namelist: [section] == &namelist, key = value.
+# Booleans are true/false (not .true./.false.). Comments use '#'.
+
+[general]
+n = 64                    # collocation points per axis (power of two preferred)
+timesteps = 0              # number of timesteps; use tmax if 0
+tmax = 10.0               # maximum simulation time
+cfl = 0.8                # Courant-Friedrichs-Lewy number
+re = 0.0                # Taylor-microscale Reynolds number; use kmaxeta if 0
+kmaxeta = 2.0          # target k_max * Kolmogorov microscale
+stop_at_disspeak = true  # stop at the dissipation peak?
+valid = false            # run the energy/dissipation budget test each step?
+
+[hydro]
+viscous = true            # include viscous terms?
+burgers = false          # drop the pressure term? (Burgers eq.)
+
+[force]
+forced = false            # force the hydro equations?
+variable_forcing = true   # true: Kaneda et al. (2004) negative-viscosity forcing
+kforcing = 2.5           # maximum forced wavenumber
+
+[numerics]
+integration_method = 2    # 1: RK2, 2: RK4
+truncation = 2           # 0: two-thirds, 1: spherical, 2: polyhedral
+dealiasing = 1          # 0: none, 1: Patterson-Orszag
+
+[initialconditions]
+initcond = 4              # 0: zero, 1: stochastic flat, 2: stochastic spectrum,
+                        # 3: Orszag-Tang, 4: ABC flow, 5: Taylor-Green
+kinitcond = 2.5         # exponential cutoff wavenumber for ICs
+seedrandom = false      # seed the RNG for reproducibility?
+boundcond = 0          # 0: periodic, 1: free-slip
+
+[inputoutput]
+outputfiles = true        # write 3D HDF5 fields?
+input_field = false      # read initial condition from file?
+input_field_filename = "ic.h5"
+nfilestart = 0
+hdf5frate = 10.0        # HDF5 output framerate
+compression_level = 0   # gzip level 0-9
+hdf5_overwrite = false

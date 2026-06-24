@@ -1,0 +1,14 @@
+# ALIAKMON_py — hydro DNS solver (distributed-memory CPU, MPI)
+#
+# System prerequisites (install via your package manager, not pip):
+#   - an MPI implementation (OpenMPI or MPICH)
+#   - FFTW3 dev package, e.g. on Debian/Ubuntu:
+#       sudo apt-get install libfftw3-dev libfftw3-mpi-dev
+#
+numpy>=1.24
+mpi4py>=4.0           # MPI bindings (needs system MPI)
+mpi4py-fft>=2.0       # distributed slab/pencil FFTs (needs system FFTW dev)
+numba>=0.59           # @njit(parallel=True) pointwise kernels
+h5py>=3.10            # HDF5 field output
+# tomllib is in the Python 3.11+ stdlib; tomli is the backport for 3.10
+tomli>=2.0 ; python_version < "3.11"

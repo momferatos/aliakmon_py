@@ -1,0 +1,138 @@
+"""Configuration loading and progress reporting (input_output.f90, hydro).
+
+Two responsibilities survive from the Fortran module in the hydro port:
+
+* :func:`load_config` — the analogue of ``read_namelist_file``; it reads the
+  TOML run file into a :class:`~aliakmon_py.parameters.Config`.
+* :func:`print_progress` — a trimmed ``print_progress`` that gathers the hydro
+  diagnostics (energy, dissipation, length scales, Reynolds numbers) and prints
+  the per-step status box on the root rank, optionally logging ``hydro.dat``.
+
+MHD, passive-scalar, particle and forcing-feedback reporting are omitted.
+"""
+
+from __future__ import annotations
+
+import math
+import time as _time
+from dataclasses import dataclass
+from pathlib import Path
+
+from .backend import IS_ROOT
+from .data import State
+from .parameters import Config
+from . import numerics as N
+
+
+def load_config(path: str | Path = "config.toml") -> Config:
+    """Read the TOML run configuration (replaces ``read_namelist_file``)."""
+    return Config.from_toml(path)
+
+
+@dataclass
+class Progress:
+    """Wall-clock bookkeeping for the estimated-time-left readout."""
+
+    t_start: float = 0.0
+
+    def start(self) -> None:
+        self.t_start = _time.perf_counter()
+
+    def elapsed(self) -> float:
+        return _time.perf_counter() - self.t_start
+
+
+def _split_hms(seconds: float):
+    """Break a duration into (days, hours, minutes, seconds)."""
+    seconds = max(seconds, 0.0)
+    days, seconds = divmod(int(seconds), 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return days, hours, minutes, seconds
+
+
+def compute_diagnostics(state: State) -> dict:
+    """Evaluate the hydro diagnostics reported each timestep.
+
+    Mirrors the hydro portion of ``print_progress``: divergence, kinetic
+    energy, dissipation, kinetic helicity, the integral length scale and the
+    derived Taylor/Kolmogorov scales and Reynolds numbers.
+    """
+    nu = float(state.visc[0])
+    ke = N.kinetic_energy(state)
+    rmsu = math.sqrt(2.0 / 3.0 * ke) if ke > 0.0 else 1.0
+    emean = N.mean_dissipation(state) if state.cfg.viscous else 0.0
+    ils, _ = N.integral_length_scale(state)
+
+    # Taylor microscale and its Reynolds number use the dissipation estimate;
+    # guard against the zero-dissipation (inviscid / initial) case.
+    eps = emean if emean > 0.0 else 1.0
+    lam = math.sqrt(15.0 * nu * rmsu ** 2 / eps) if nu > 0.0 else 0.0
+    rel = rmsu * lam / nu if nu > 0.0 else 0.0
+    eta = (nu ** 3 / eps) ** 0.25 if nu > 0.0 else 0.0
+    ett = ils / (3.0 * rmsu) if rmsu > 0.0 else 0.0
+    re = rmsu * ils / nu if nu > 0.0 else 0.0
+
+    return dict(
+        maxdiv=N.incompressibility(state),
+        ke=ke, rmsu=rmsu, emean=emean,
+        mkh=N.mean_kinetic_helicity(state),
+        ils=ils, lam=lam, rel=rel, eta=eta, ett=ett, re=re,
+        maxvel=getattr(state, "maxvel", 0.0),
+        maxvort=getattr(state, "maxvort", 0.0),
+    )
+
+
+def print_progress(state: State, ntimestep: int, t: float, dt: float,
+                   progress: Progress, hydro_log=None) -> dict:
+    """Print the per-step status box and return the computed diagnostics.
+
+    ``hydro_log`` is an optional open text file; when given a row of the key
+    scalars is appended (the hydro.dat stream of the original).
+    """
+    diag = compute_diagnostics(state)
+    if not IS_ROOT:
+        return diag
+
+    cfg = state.cfg
+    if cfg.timesteps != 0:
+        percent = ntimestep / cfg.timesteps * 100.0
+    elif cfg.tmax > 0.0:
+        percent = t / cfg.tmax * 100.0
+    else:
+        percent = 0.0
+
+    elapsed = progress.elapsed()
+    if percent > 0.0:
+        etl = elapsed * (100.0 - percent) / percent
+    else:
+        etl = 0.0
+    ed = _split_hms(elapsed)
+    ld = _split_hms(etl)
+    kmax_eta = state.kmax * diag["eta"]
+
+    bar = "-" * 72
+    star = "*" * 72
+    print(star)
+    print(f"| {percent:6.2f}% | elapsed {ed[0]:d}:{ed[1]:02d}:{ed[2]:02d}:{ed[3]:02d}"
+          f" | ETL {ld[0]:d}:{ld[1]:02d}:{ld[2]:02d}:{ld[3]:02d}")
+    print(bar)
+    print(f"| step {ntimestep:6d} | t {t:9.4f} | div {diag['maxdiv']:9.2e}"
+          f" | maxw {diag['maxvort']:9.2e} | maxu {diag['maxvel']:9.2e}")
+    print(bar)
+    print(f"| kmax*eta {kmax_eta:7.3f} | Rel {diag['rel']:9.3f}"
+          f" | dt {dt:9.2e} | KE {diag['ke']:9.5f}")
+    print(bar)
+    print(f"| RE {diag['re']:8.3f} | eta {diag['eta']:8.4f}"
+          f" | lambda {diag['lam']:8.4f} | L {diag['ils']:8.4f}"
+          f" | ETT {diag['ett']:8.4f}")
+    print(star, flush=True)
+
+    if hydro_log is not None:
+        hydro_log.write(
+            f"{t:24.8e} {diag['ke']:24.8e} {diag['mkh']:24.8e} "
+            f"{diag['emean']:24.8e} {diag['ils']:24.8e} {diag['lam']:24.8e} "
+            f"{diag['eta']:24.8e} {diag['re']:24.8e} {diag['rel']:24.8e}\n")
+        hydro_log.flush()
+
+    return diag

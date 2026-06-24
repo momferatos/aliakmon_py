@@ -1,0 +1,20 @@
+# virtualenv / caches
+.venv/
+__pycache__/
+*.pyc
+.idea/
+
+# build artifacts
+build/
+
+# experiment dirs + run output (data, not code)
+runs/
+compare/
+fortran_reference/
+output.*.h5
+output.*.xmf
+slice.*
+*.h5
+*.xmf
+*.png
+*.dat
