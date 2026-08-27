@@ -42,10 +42,12 @@ class _SerialComm:
 if _HAVE_MPI:
     COMM = MPI.COMM_WORLD
     _MAX = MPI.MAX
+    _MIN = MPI.MIN
     _SUM = MPI.SUM
 else:  # pragma: no cover
     COMM = _SerialComm()
     _MAX = "max"
+    _MIN = "min"
     _SUM = "sum"
 
 RANK = COMM.rank
@@ -56,6 +58,11 @@ IS_ROOT = RANK == 0
 def allreduce_max(value: float) -> float:
     """Global maximum of a scalar across all ranks."""
     return float(COMM.allreduce(value, op=_MAX))
+
+
+def allreduce_min(value: float) -> float:
+    """Global minimum of a scalar across all ranks."""
+    return float(COMM.allreduce(value, op=_MIN))
 
 
 def allreduce_sum(value: float) -> float:

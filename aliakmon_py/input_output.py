@@ -20,8 +20,31 @@ from pathlib import Path
 
 from .backend import IS_ROOT
 from .data import State
-from .parameters import Config
+from .parameters import Config, KENTAR
 from . import numerics as N
+
+
+_FORCING_TOL = 1.0e-2   # KE dead-band around KENTAR (Fortran: tol)
+_FORCING_DFS = 0.05     # fscale step size per timestep (Fortran: dfs)
+
+
+def _update_fscale(state: State, ke: float) -> None:
+    """Kaneda et al. (2004) fscale feedback; called each step on all ranks.
+
+    Adjusts state.fscale so kinetic energy tracks KENTAR: ramp fscale up when
+    KE is below target and falling, down when above target and rising. All
+    ranks compute the identical update (ke is a global allreduce), so no
+    broadcast is needed.
+    """
+    cfg = state.cfg
+    if not (cfg.forced and cfg.viscous and cfg.variable_forcing):
+        return
+    ke_prev = state._ke_prev
+    if ke < KENTAR - _FORCING_TOL and ke <= ke_prev:
+        state.fscale[:] += _FORCING_DFS
+    elif ke > KENTAR + _FORCING_TOL and ke >= ke_prev:
+        state.fscale[:] -= _FORCING_DFS
+    state._ke_prev = ke
 
 
 def load_config(path: str | Path = "config.toml") -> Config:
@@ -58,7 +81,10 @@ def compute_diagnostics(state: State) -> dict:
     energy, dissipation, kinetic helicity, the integral length scale and the
     derived Taylor/Kolmogorov scales and Reynolds numbers.
     """
-    nu = float(state.visc[0])
+    # The Taylor/Kolmogorov scales and their Reynolds numbers are defined
+    # against the molecular viscosity, so use the scalar floor of nu(k) rather
+    # than any mode-dependent (eddy) part sitting on top of it.
+    nu = state.nu_mol
     ke = N.kinetic_energy(state)
     rmsu = math.sqrt(2.0 / 3.0 * ke) if ke > 0.0 else 1.0
     emean = N.mean_dissipation(state) if state.cfg.viscous else 0.0
@@ -91,6 +117,7 @@ def print_progress(state: State, ntimestep: int, t: float, dt: float,
     scalars is appended (the hydro.dat stream of the original).
     """
     diag = compute_diagnostics(state)
+    _update_fscale(state, diag["ke"])   # all ranks keep fscale in sync
     if not IS_ROOT:
         return diag
 
@@ -120,8 +147,9 @@ def print_progress(state: State, ntimestep: int, t: float, dt: float,
     print(f"| step {ntimestep:6d} | t {t:9.4f} | div {diag['maxdiv']:9.2e}"
           f" | maxw {diag['maxvort']:9.2e} | maxu {diag['maxvel']:9.2e}")
     print(bar)
+    fhd_str = f" | FHD {state.fscale[0]:+8.4f}" if cfg.forced else ""
     print(f"| kmax*eta {kmax_eta:7.3f} | Rel {diag['rel']:9.3f}"
-          f" | dt {dt:9.2e} | KE {diag['ke']:9.5f}")
+          f"{fhd_str} | dt {dt:9.2e} | KE {diag['ke']:9.5f}")
     print(bar)
     print(f"| RE {diag['re']:8.3f} | eta {diag['eta']:8.4f}"
           f" | lambda {diag['lam']:8.4f} | L {diag['ils']:8.4f}"
@@ -132,7 +160,8 @@ def print_progress(state: State, ntimestep: int, t: float, dt: float,
         hydro_log.write(
             f"{t:24.8e} {diag['ke']:24.8e} {diag['mkh']:24.8e} "
             f"{diag['emean']:24.8e} {diag['ils']:24.8e} {diag['lam']:24.8e} "
-            f"{diag['eta']:24.8e} {diag['re']:24.8e} {diag['rel']:24.8e}\n")
+            f"{diag['eta']:24.8e} {diag['re']:24.8e} {diag['rel']:24.8e} "
+            f"{state.fscale[0]:24.8e}\n")
         hydro_log.flush()
 
     return diag

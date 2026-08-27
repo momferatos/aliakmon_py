@@ -38,6 +38,11 @@ def _triple_cmplx(T: Transforms):
     return [np.zeros(T.cmplx_shape, dtype=np.complex128) for _ in range(NFIELDS)]
 
 
+def _triple_spectral_real(T: Transforms):
+    """Three real-valued arrays laid out on the *Fourier* grid (e.g. nu(k))."""
+    return [np.zeros(T.cmplx_shape, dtype=np.float64) for _ in range(NFIELDS)]
+
+
 class State:
     """All GPU-free, MPI-distributed fields and spectral metadata for a run."""
 
@@ -60,8 +65,19 @@ class State:
         # Primary evolved state: velocity in Fourier space, per component.
         self.fu = _triple_cmplx(self.T)
 
-        # Per-component kinematic viscosity (set once Re is known).
-        self.visc = np.zeros(NFIELDS, dtype=np.float64)
+        # Per-component kinematic viscosity nu_c(k), one real array per
+        # velocity component on the local Fourier grid (set once Re is known).
+        # A uniform molecular viscosity is just a constant array; a spectral
+        # eddy viscosity varies with |k|. `nu_mol` keeps the scalar molecular
+        # floor that the Taylor/Kolmogorov diagnostics are defined against.
+        self.visc = _triple_spectral_real(self.T)
+        self.nu_mol = 0.0
+
+        # Kaneda et al. (2004) negative-viscosity forcing state.
+        # fscale is updated each step by input_output._update_fscale.
+        # _ke_prev mirrors the Fortran `save :: kenprev = 1.0_rk`.
+        self.fscale = np.zeros(NFIELDS, dtype=np.float64)
+        self._ke_prev = 1.0
 
         # Mean-square normalisation in Fourier space (MSFAC, aliakmon.f90:160).
         self.msfac = 1.0 / float(self.n ** 3)
@@ -117,8 +133,8 @@ class State:
         local_max = float(local_active.max()) if local_active.size else 0.0
         self.k_max_active = allreduce_max(local_max)
         self.nmodes = int(allreduce_sum(int(self.mask.sum())))
-
-    def apply_mask(self, fields) -> None:
+    
+    def apply_truncation_mask(self, fields) -> None:
         """Zero every truncated mode of each component field (truncate())."""
         for f in fields:
             f *= self.mask

@@ -82,15 +82,20 @@ Two interop gotchas:
    step (sheds ~half the energy on step 1). The port is periodic-only; use
    `BOUNDCOND=0` to compare. Free-slip BCs are NOT ported.
 
-## NOT YET PORTED — forcing
-`forced`/`variable_forcing`/`kforcing` are read into Config but **forcing is a
-no-op**: `compute_rhs` has no forcing term. Runs are always *decaying*. To get
-statistically-steady turbulence, port the Kaneda et al. (2004) negative-
-viscosity forcing (the `fscale` feedback in input_output.f90:194-249 plus the
-forcing term in numerics.f90 `right_hand_side`).
+## Done & VALIDATED (continued)
+- `forcing` — Kaneda et al. (2004) negative-viscosity forcing:
+  - `data.py` `State`: `fscale[3]` (init 0) + `_ke_prev` (init 1.0)
+  - `numerics.py` `_apply_forcing`: adds `fscale[c]*fu_hat[k]` for modes with
+    kx≠0, ky≠0, kz≠0, |k|<kforcing; called in `compute_rhs` before projection
+  - `input_output.py` `_update_fscale`: Kaneda energy feedback (tol=0.01,
+    dfs=0.05), called each step in `print_progress` on all ranks; no extra
+    broadcast needed since KE is already a global allreduce.  `fscale` printed
+    as FHD in the progress box and logged in hydro.dat (column 10).
+  Enable with `[force] forced=true variable_forcing=true kforcing=2.5` in
+  config.toml. KE tracks KENTAR=0.5 within ~2% after ~100 steps (n=32 ABC).
 
 ## TODO (next)
-The hydro port is feature-complete and runnable (decaying turbulence).
+The hydro port is feature-complete and runnable (decaying AND forced turbulence).
 Possible follow-ups:
 energy spectrum file per output frame (`output_spectra`), 2D slice output
 (`output_slices`), dissipation-peak detection / `stop_at_disspeak`, gzip

@@ -31,10 +31,10 @@ def _from_real(state: State, comps) -> None:
     """Forward-transform three real components, then project and truncate."""
     for c in range(3):
         state.T.forward(np.ascontiguousarray(comps[c]), state.fu[c])
-    state.apply_mask(state.fu)
+    state.apply_truncation_mask(state.fu)
     K.project_solenoidal(state.fu[0], state.fu[1], state.fu[2],
                          state.kx, state.ky, state.kz)
-    state.apply_mask(state.fu)
+    state.apply_truncation_mask(state.fu)
 
 
 def normalize_ms(state: State, target_ms: float = 1.0) -> None:
@@ -114,10 +114,10 @@ def abc_flow(state: State, a: float = 0.1, b: float = 0.3, c: float = 0.4,
     # Add the perturbation, then enforce solenoidality and truncate.
     for c in range(3):
         state.fu[c] += abc_rand * perturbation[c]
-    state.apply_mask(state.fu)
+    state.apply_truncation_mask(state.fu)
     K.project_solenoidal(state.fu[0], state.fu[1], state.fu[2],
                          state.kx, state.ky, state.kz)
-    state.apply_mask(state.fu)
+    state.apply_truncation_mask(state.fu)
 
 
 def orszag_tang(state: State) -> None:
@@ -132,10 +132,10 @@ def orszag_tang(state: State) -> None:
 
 def _finalize_stochastic(state: State) -> None:
     """Mask, project solenoidal, mask again — shared tail of the generators."""
-    state.apply_mask(state.fu)
+    state.apply_truncation_mask(state.fu)
     K.project_solenoidal(state.fu[0], state.fu[1], state.fu[2],
                          state.kx, state.ky, state.kz)
-    state.apply_mask(state.fu)
+    state.apply_truncation_mask(state.fu)
 
 
 def random_field(state: State, kmax_cut: float = 2.0,

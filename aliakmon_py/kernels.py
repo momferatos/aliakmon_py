@@ -105,17 +105,19 @@ def project_solenoidal(vx, vy, vz, kx, ky, kz):
 
 @njit(**_OPTS)
 def add_viscous(rhs, fu, visc, k2):
-    """Add the viscous term to one component's RHS: rhs += -nu k^2 fu.
+    """Add the viscous term to one component's RHS: rhs += -nu(k) k^2 fu.
 
-    ``k2`` is the local squared-wavenumber array (same shape as ``fu``);
-    ``visc`` is the scalar kinematic viscosity for this component
-    (compute_diffusive_terms in numerics.f90).
+    ``k2`` is the local squared-wavenumber array (same shape as ``fu``) and
+    ``visc`` is this component's kinematic viscosity on the same grid, so the
+    damping rate may vary from mode to mode (uniform molecular viscosity is
+    the constant-array case). Generalises compute_diffusive_terms in
+    numerics.f90, which carries a single scalar per component.
     """
     a, b, c = fu.shape
     for i in prange(a):
         for j in range(b):
             for k in range(c):
-                rhs[i, j, k] += -visc * k2[i, j, k] * fu[i, j, k]
+                rhs[i, j, k] += -visc[i, j, k] * k2[i, j, k] * fu[i, j, k]
 
 
 @njit(**_OPTS)
@@ -139,3 +141,4 @@ def rk_stage(fu, rhs, accum, c_accum, half_or_full, stage_state):
                 r = rhs[i, j, k]
                 accum[i, j, k] += c_accum * r
                 stage_state[i, j, k] = fu[i, j, k] + half_or_full * r
+

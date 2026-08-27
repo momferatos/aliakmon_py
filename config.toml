@@ -3,7 +3,7 @@
 # Booleans are true/false (not .true./.false.). Comments use '#'.
 
 [general]
-n = 64                    # collocation points per axis (power of two preferred)
+n = 128                   # collocation points per axis (power of two preferred)
 timesteps = 0              # number of timesteps; use tmax if 0
 tmax = 10.0               # maximum simulation time
 cfl = 0.8                # Courant-Friedrichs-Lewy number

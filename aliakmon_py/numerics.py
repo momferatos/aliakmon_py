@@ -18,12 +18,33 @@ import math
 import numpy as np
 
 from . import kernels as K
-from .backend import allreduce_array, allreduce_max, allreduce_sum
+from .backend import (allreduce_array, allreduce_max, allreduce_min,
+                      allreduce_sum)
 from .data import State
-from .parameters import (D, LBOX, RMSUTAR, Config, Dealiasing, Integration)
+from .parameters import (D, LBOX, NFIELDS, RMSUTAR, Config, Dealiasing,
+                         Integration)
 
 # RK4 stage weights (rkc in runge_kutta4).
 _RKC = (1.0 / 6.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0)
+
+
+# ----------------------------------------------------------------------
+# Kaneda et al. (2004) negative-viscosity forcing  (forcing_rhs)
+# ----------------------------------------------------------------------
+def _apply_forcing(state: State, fin) -> None:
+    """Add the Kaneda forcing term to state.rhs for the low-k band.
+
+    Forced modes satisfy: kx≠0, ky≠0, kz≠0, and |k| < cfg.kforcing.
+    The term is fscale[c] * fin[c] (negative viscosity in spectral space).
+    state.fscale is updated each step via input_output._update_fscale.
+    """
+    kf = state.cfg.kforcing
+    forced = (
+        (state.KX != 0) & (state.KY != 0) & (state.KZ != 0)
+        & (np.sqrt(state.K2) < kf)
+    ).astype(np.float64)
+    for c in range(3):
+        state.rhs[c] += state.fscale[c] * forced * fin[c]
 
 
 # ----------------------------------------------------------------------
@@ -83,20 +104,23 @@ def compute_rhs(state: State, fin) -> None:
             fnl[c][...] = 0.5 * (fnl[c] + fnls[c] * state.iphase)
 
     # Remove aliased modes.
-    state.apply_mask(fnl)
+    state.apply_truncation_mask(fnl)
 
-    # Diffusive term and assemble RHS: rhs = nl - nu k^2 fu  (+ forcing).
+    # Diffusive term and assemble RHS: rhs = nl - nu(k) k^2 fu + f_forcing.
     for c in range(3):
         state.rhs[c][...] = fnl[c]
         if cfg.viscous:
-            K.add_viscous(state.rhs[c], fin[c], float(state.visc[c]), state.K2)
+            K.add_viscous(state.rhs[c], fin[c], state.visc[c], state.K2)
+
+    if cfg.forced:
+        _apply_forcing(state, fin)
 
     # Project onto the divergence-free subspace (skip for Burgers).
     if not cfg.burgers:
         K.project_solenoidal(state.rhs[0], state.rhs[1], state.rhs[2],
                              state.kx, state.ky, state.kz)
 
-    state.apply_mask(state.rhs)
+    state.apply_truncation_mask(state.rhs)
 
 
 # ----------------------------------------------------------------------
@@ -188,23 +212,22 @@ def kinetic_energy(state: State, fin=None) -> float:
 
 
 def mean_dissipation(state: State, fin=None) -> float:
-    """Mean viscous dissipation rate eps = nu <|omega|^2> = 2 nu Z.
+    """Mean viscous dissipation rate eps = <nu(k) |omega|^2>.
 
-    Computed spectrally as sum over modes of nu * k^2 * |u_hat|^2, accounting
-    for the Hermitian symmetry of the real transform (interior kz modes count
-    twice). Uses the x-component viscosity (isotropic in the hydro case).
+    Computed spectrally as the sum over modes of nu_c(k) * k^2 * |u_hat_c|^2,
+    accounting for the Hermitian symmetry of the real transform (interior kz
+    modes count twice). This is exactly the energy the diffusion term of
+    :func:`compute_rhs` removes, so it stays consistent with the budget check
+    in :mod:`aliakmon_py.validation` for any nu(k); with a uniform viscosity it
+    collapses to the familiar eps = nu <|omega|^2> = 2 nu Z.
     """
-    nu = float(state.visc[0])
-    # Hermitian weights: kz==0 and kz==N/2 once, the rest twice.
-    n = state.n
-    wz = np.where((state.kz == 0) | (state.kz == n // 2), 1.0, 2.0)
-    weight = wz[None, None, :]
+    weight = _hermitian_weight(state)
     local = 0.0
-    for c in range(3):
-        e = (np.abs(fin[c] if fin is not None else state.fu[c]) ** 2)
-        local += float(np.sum(weight * state.K2 * e))
-    eps = nu * allreduce_sum(local)
-    return eps
+    for c in range(NFIELDS):
+        f = state.fu[c] if fin is None else fin[c]
+        e = np.abs(f) ** 2
+        local += float(np.sum(state.visc[c] * weight * state.K2 * e))
+    return allreduce_sum(local)
 
 
 def incompressibility(state: State, fin=None) -> float:
@@ -287,9 +310,39 @@ def integral_length_scale(state: State, fin=None):
 # ----------------------------------------------------------------------
 # Viscosity setup  (Reynolds-number handling from aliakmon.f90)
 # ----------------------------------------------------------------------
-def set_viscosity(state: State, nu: float) -> None:
-    """Set an isotropic kinematic viscosity on every velocity component."""
-    state.visc[:] = nu
+def set_viscosity(state: State, nu) -> None:
+    """Set the kinematic viscosity nu(k) on every velocity component.
+
+    ``nu`` may be
+
+    * a scalar — a uniform molecular viscosity (the classic DNS case);
+    * a single array broadcastable to the local Fourier grid — one spectral
+      viscosity profile shared by the three components;
+    * a length-3 list/tuple of either — one profile per component.
+
+    Values are *copied* into ``state.visc``, so callers keep ownership of their
+    own buffers. ``state.nu_mol`` is refreshed to the global minimum over all
+    components and modes: for a molecular viscosity carrying a non-negative
+    eddy viscosity on top, that is the molecular floor the Taylor/Kolmogorov
+    diagnostics are defined against, and it reduces to ``nu`` exactly in the
+    scalar case.
+    """
+    if isinstance(nu, (list, tuple)):
+        if len(nu) != NFIELDS:
+            raise ValueError(
+                f"set_viscosity: expected {NFIELDS} components, got {len(nu)}")
+        parts = nu
+    else:
+        parts = (nu,) * NFIELDS
+
+    # `[...] =` broadcasts scalars and shaped arrays alike, and raises on a
+    # shape that does not fit the local Fourier grid.
+    for c in range(NFIELDS):
+        state.visc[c][...] = parts[c]
+
+    local_min = min((float(v.min()) for v in state.visc if v.size),
+                    default=math.inf)
+    state.nu_mol = allreduce_min(local_min)
 
 
 def setup_viscosity(state: State) -> dict:

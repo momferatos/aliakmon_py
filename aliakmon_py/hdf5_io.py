@@ -167,5 +167,5 @@ def read_field(state: State, filename: str) -> float:
         comp = data[..., c].transpose(2, 1, 0)  # [gz,gy,gx] -> [gx,gy,gz]
         local = np.ascontiguousarray(comp[sl])
         state.T.forward(local, state.fu[c])
-    state.apply_mask(state.fu)
+    state.apply_truncation_mask(state.fu)
     return time
