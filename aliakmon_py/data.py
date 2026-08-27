@@ -72,6 +72,9 @@ class State:
         # floor that the Taylor/Kolmogorov diagnostics are defined against.
         self.visc = _triple_spectral_real(self.T)
         self.nu_mol = 0.0
+        # Last subgrid-model report (numerics.update_eddy_viscosity); None
+        # for a pure DNS run.
+        self.les_info = None
 
         # Kaneda et al. (2004) negative-viscosity forcing state.
         # fscale is updated each step by input_output._update_fscale.

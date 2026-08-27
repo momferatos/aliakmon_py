@@ -60,6 +60,13 @@ class Forcing(IntEnum):
     KANEDA = 1
 
 
+class LESModel(IntEnum):
+    """Subgrid model supplying the eddy viscosity (none = pure DNS)."""
+
+    NONE = 0
+    CHOLLET_LESIEUR = 1
+
+
 # --------------------------------------------------------------------------
 # Physical / mathematical constants (parameters.f90 module-level parameters)
 # --------------------------------------------------------------------------
@@ -116,6 +123,11 @@ class Config:
     variable_forcing: bool = True
     kforcing: float = 2.5
 
+    # [les]
+    les_model: LESModel = LESModel.NONE
+    les_ck: float = 1.4
+    les_kc: float = 0.0
+
     # [numerics]
     integration_method: Integration = Integration.RUNGE_KUTTA4
     truncation: Truncation = Truncation.POLYHEDRAL
@@ -143,7 +155,22 @@ class Config:
         "dealiasing": Dealiasing,
         "initcond": InitCond,
         "boundcond": BoundCond,
+        "les_model": LESModel,
     }
+
+    @property
+    def les_active(self) -> bool:
+        """True when a subgrid model contributes an eddy viscosity."""
+        return self.les_model != LESModel.NONE
+
+    @property
+    def diffusive(self) -> bool:
+        """True when the RHS carries a diffusion term at all.
+
+        An LES run supplies a viscosity even with ``viscous = false`` (no
+        molecular part), so the diffusive term must not be skipped then.
+        """
+        return self.viscous or self.les_active
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "Config":

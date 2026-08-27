@@ -94,8 +94,42 @@ Two interop gotchas:
   Enable with `[force] forced=true variable_forcing=true kforcing=2.5` in
   config.toml. KE tracks KENTAR=0.5 within ~2% after ~100 steps (n=32 ABC).
 
+- `array viscosity` — the scalar kinematic viscosity is now a per-component
+  field `nu_c(k)` on the local Fourier grid (`State.visc` is three real arrays
+  shaped like `cmplx_shape`, not three scalars). `kernels.add_viscous` indexes
+  it per mode; `mean_dissipation` sums `nu_c(k) k^2 |u_hat|^2` with nu *inside*
+  the mode sum, which keeps it exactly equal to the energy the diffusion term
+  removes so the `validation.py` budget still closes for any nu(k).
+  `set_viscosity(state, nu, nu_mol=None)` takes a scalar, one shared array or a
+  per-component list. Bitwise identical to the old scalar path for uniform nu.
+  `State.nu_mol` holds the scalar molecular viscosity for the Taylor/Kolmogorov
+  diagnostics — do NOT infer it from `min(visc)` once an LES model is on (the
+  eddy viscosity has a non-zero k->0 plateau, so the minimum is
+  `nu_mol + plateau`). Extends `compute_diffusive_terms`, which is scalar-only
+  in the Fortran.
+
+- `LES` — Chollet & Lesieur (1981) spectral eddy viscosity (NOT in the Fortran):
+  - `numerics.chollet_lesieur_nu_t`:
+    `nu_t(k) = A (1 + 34.5 exp(-3.03 k_c/k)) sqrt(E(k_c)/k_c)` with plateau
+    `A = 0.441 C_K^(-3/2)` (= 0.267 at C_K=1.4, reproducing the published
+    `0.267 + 9.21 exp(-3.03/x)` to 0.3%). Cusp is 2.667x the plateau at `k_c`.
+  - `numerics.update_eddy_viscosity`: sets `visc = nu_mol + nu_t`, called once
+    per step from `aliakmon.main` *after* `timestep`, so nu_t is frozen across
+    the RK stages and every diagnostic sees a nu_t consistent with the current
+    field. `E(k_c)` costs one global reduction — do not call it per RK stage.
+  - `Config.les_active` / `Config.diffusive`: the diffusion term and the
+    dissipation diagnostics key off `diffusive`, so `viscous=false` + LES
+    (pure eddy viscosity, no molecular part) still works.
+  Enable with `[les] les_model=1 les_ck=1.4 les_kc=0.0` (`les_kc=0` -> the
+  truncation `kmax`). Validated at n=32, Re_lambda=300 (kmax*eta=0.05, far too
+  coarse for DNS): nu_t saturates near 10x nu_mol on the plateau and 28x at the
+  cusp, and the energy budget closes to 0.1-0.3%. Expect a transient few-%
+  budget residual while nu_t first ramps up — that is the O(dt) cost of
+  freezing nu_t across a step, not an accounting error.
+
 ## TODO (next)
-The hydro port is feature-complete and runnable (decaying AND forced turbulence).
+The hydro port is feature-complete and runnable (decaying AND forced
+turbulence, DNS or Chollet-Lesieur LES).
 Possible follow-ups:
 energy spectrum file per output frame (`output_spectra`), 2D slice output
 (`output_slices`), dissipation-peak detection / `stop_at_disspeak`, gzip

@@ -32,7 +32,8 @@ class DissipationTest:
 
     def __init__(self, state: State):
         self.state = state
-        self.viscous = bool(state.cfg.viscous)
+        # Any diffusion term (molecular and/or subgrid) removes energy.
+        self.viscous = bool(state.cfg.diffusive)
         # Rolling samples of (kinetic energy, dissipation rate).
         self._energy: list[float] = []
         self._eps: list[float] = []

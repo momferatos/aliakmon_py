@@ -46,6 +46,11 @@ def _banner(state: State, info: dict) -> None:
           f" | lambda {info['lambda_target']:10.3e}")
     print(f"| IC {cfg.initcond.name} | integration {cfg.integration_method.name}"
           f" | truncation {cfg.truncation.name}")
+    if cfg.les_active:
+        kc = cfg.les_kc if cfg.les_kc > 0.0 else state.kmax
+        print(f"| LES {cfg.les_model.name} | C_K {cfg.les_ck:5.3f} "
+              f"| nu_t+ plateau {N.chollet_lesieur_plateau(cfg.les_ck):6.4f} "
+              f"| k_c {kc:8.3f}")
     print("=" * 72, flush=True)
 
 
@@ -90,6 +95,10 @@ def main(config_path: str | Path = "config.toml") -> None:
         hdf5_io.write_field(state, time, nhdf5)
         nhdf5 += 1
 
+    # Seed nu_t(k) from the initial condition so the first step and the first
+    # diagnostics already carry the subgrid model.
+    N.update_eddy_viscosity(state)
+
     validator = DissipationTest(state) if cfg.valid else None
     hydro_log = open("hydro.dat", "w") if IS_ROOT else None
 
@@ -106,6 +115,12 @@ def main(config_path: str | Path = "config.toml") -> None:
             dt = N.cfl_dt(state)
             state._dt = dt
             N.timestep(state, dt)
+
+            # Refresh nu_t(k) from the spectrum of the field just produced, so
+            # it is frozen across the next step's RK stages and every
+            # diagnostic below sees a nu_t consistent with the current field.
+            # No-op for DNS.
+            N.update_eddy_viscosity(state)
 
             if validator is not None:
                 validator.update(dt)

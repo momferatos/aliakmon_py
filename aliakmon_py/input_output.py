@@ -87,7 +87,7 @@ def compute_diagnostics(state: State) -> dict:
     nu = state.nu_mol
     ke = N.kinetic_energy(state)
     rmsu = math.sqrt(2.0 / 3.0 * ke) if ke > 0.0 else 1.0
-    emean = N.mean_dissipation(state) if state.cfg.viscous else 0.0
+    emean = N.mean_dissipation(state) if state.cfg.diffusive else 0.0
     ils, _ = N.integral_length_scale(state)
 
     # Taylor microscale and its Reynolds number use the dissipation estimate;
@@ -154,6 +154,11 @@ def print_progress(state: State, ntimestep: int, t: float, dt: float,
     print(f"| RE {diag['re']:8.3f} | eta {diag['eta']:8.4f}"
           f" | lambda {diag['lam']:8.4f} | L {diag['ils']:8.4f}"
           f" | ETT {diag['ett']:8.4f}")
+    les = state.les_info
+    if les is not None:
+        print(bar)
+        print(f"| nu_mol {state.nu_mol:9.3e} | nu_t plateau {les['plateau']:9.3e}"
+              f" | cusp {les['peak']:9.3e} | E(k_c) {les['e_kc']:9.3e}")
     print(star, flush=True)
 
     if hydro_log is not None:

@@ -22,7 +22,7 @@ from .backend import (allreduce_array, allreduce_max, allreduce_min,
                       allreduce_sum)
 from .data import State
 from .parameters import (D, LBOX, NFIELDS, RMSUTAR, Config, Dealiasing,
-                         Integration)
+                         Integration, LESModel)
 
 # RK4 stage weights (rkc in runge_kutta4).
 _RKC = (1.0 / 6.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0)
@@ -109,7 +109,7 @@ def compute_rhs(state: State, fin) -> None:
     # Diffusive term and assemble RHS: rhs = nl - nu(k) k^2 fu + f_forcing.
     for c in range(3):
         state.rhs[c][...] = fnl[c]
-        if cfg.viscous:
+        if cfg.diffusive:
             K.add_viscous(state.rhs[c], fin[c], state.visc[c], state.K2)
 
     if cfg.forced:
@@ -310,7 +310,7 @@ def integral_length_scale(state: State, fin=None):
 # ----------------------------------------------------------------------
 # Viscosity setup  (Reynolds-number handling from aliakmon.f90)
 # ----------------------------------------------------------------------
-def set_viscosity(state: State, nu) -> None:
+def set_viscosity(state: State, nu, nu_mol: float | None = None) -> None:
     """Set the kinematic viscosity nu(k) on every velocity component.
 
     ``nu`` may be
@@ -321,11 +321,15 @@ def set_viscosity(state: State, nu) -> None:
     * a length-3 list/tuple of either — one profile per component.
 
     Values are *copied* into ``state.visc``, so callers keep ownership of their
-    own buffers. ``state.nu_mol`` is refreshed to the global minimum over all
-    components and modes: for a molecular viscosity carrying a non-negative
-    eddy viscosity on top, that is the molecular floor the Taylor/Kolmogorov
-    diagnostics are defined against, and it reduces to ``nu`` exactly in the
-    scalar case.
+    own buffers.
+
+    ``nu_mol`` records the scalar molecular viscosity that the Taylor and
+    Kolmogorov diagnostics are defined against. Pass it explicitly whenever
+    ``nu`` carries a subgrid contribution: the Chollet-Lesieur eddy viscosity
+    tends to a non-zero *plateau* as k -> 0, so the minimum of nu(k) is
+    ``nu_mol + plateau`` and would overstate the molecular value. Left at
+    ``None`` it falls back to the global minimum over all components and
+    modes, which is exact for a uniform viscosity.
     """
     if isinstance(nu, (list, tuple)):
         if len(nu) != NFIELDS:
@@ -340,9 +344,96 @@ def set_viscosity(state: State, nu) -> None:
     for c in range(NFIELDS):
         state.visc[c][...] = parts[c]
 
-    local_min = min((float(v.min()) for v in state.visc if v.size),
-                    default=math.inf)
-    state.nu_mol = allreduce_min(local_min)
+    if nu_mol is not None:
+        state.nu_mol = float(nu_mol)
+    else:
+        local_min = min((float(v.min()) for v in state.visc if v.size),
+                        default=math.inf)
+        state.nu_mol = allreduce_min(local_min)
+
+
+# ----------------------------------------------------------------------
+# Chollet-Lesieur spectral eddy viscosity
+# ----------------------------------------------------------------------
+# Chollet & Lesieur (1981), J. Atmos. Sci. 38, 2747; see also Lesieur &
+# Metais (1996), Annu. Rev. Fluid Mech. 28, 45. The EDQNM closure applied to
+# a sharp spectral cutoff at k_c gives a wavenumber-dependent eddy viscosity
+#
+#     nu_t(k|k_c) = nu_t^+(k/k_c) * sqrt( E(k_c) / k_c )
+#
+# whose non-dimensional shape is a plateau plus a cusp rising towards the
+# cutoff:
+#
+#     nu_t^+(x) = A * ( 1 + _CUSP_AMP * exp(-_CUSP_DECAY / x) ),
+#     A         = 0.441 * C_K^(-3/2)      (the k -> 0 plateau)
+#
+# With the standard Kolmogorov constant C_K = 1.4 this is the familiar
+# nu_t^+(x) = 0.267 + 9.21 exp(-3.03/x): flat at low k, and ~2.7x larger at
+# the cutoff itself, where the model drains the energy the truncated modes
+# would otherwise have carried away.
+_CUSP_AMP = 34.5
+_CUSP_DECAY = 3.03
+_PLATEAU_COEFF = 0.441
+
+
+def chollet_lesieur_plateau(ck: float) -> float:
+    """Non-dimensional plateau eddy viscosity nu_t^+(0) for a given C_K."""
+    return _PLATEAU_COEFF * ck ** -1.5
+
+
+def chollet_lesieur_nu_t(state: State, fin=None) -> tuple:
+    """Chollet-Lesieur eddy viscosity nu_t(k) on the local Fourier grid.
+
+    Returns ``(nu_t, info)`` where ``nu_t`` is a real array shaped like the
+    local Fourier grid and ``info`` reports the cutoff ``kc``, the spectrum
+    ``e_kc = E(k_c)`` it was built from, and the resulting ``plateau`` and
+    ``peak`` (cutoff) eddy viscosities.
+
+    ``E(k_c)`` is read off the shell-binned spectrum, so this performs one
+    global reduction; call it once per timestep rather than per RK stage.
+    """
+    cfg = state.cfg
+    kc = float(cfg.les_kc) if cfg.les_kc > 0.0 else float(state.kmax)
+
+    k, e = energy_spectrum(state, fin)
+    # E(k_c) from the shell straddling the cutoff, clamped to the last bin.
+    ic = min(max(int(round(kc)), 0), e.size - 1)
+    e_kc = float(e[ic])
+
+    amp = chollet_lesieur_plateau(cfg.les_ck) * math.sqrt(max(e_kc, 0.0) / kc)
+
+    # cusp = exp(-decay * kc/k); at k = 0 the ratio is +inf and exp() is 0,
+    # leaving the plateau, which is the correct k -> 0 limit.
+    kmag = np.sqrt(state.K2)
+    ratio = np.divide(kc, kmag, out=np.full_like(kmag, np.inf), where=kmag > 0)
+    nu_t = amp * (1.0 + _CUSP_AMP * np.exp(-_CUSP_DECAY * ratio))
+
+    info = dict(kc=kc, e_kc=e_kc, plateau=amp,
+                peak=amp * (1.0 + _CUSP_AMP * math.exp(-_CUSP_DECAY)))
+    return nu_t, info
+
+
+def update_eddy_viscosity(state: State, fin=None) -> dict | None:
+    """Refresh ``state.visc`` with nu_mol + nu_t(k) for the configured model.
+
+    A no-op returning ``None`` when no subgrid model is active. Call once per
+    timestep, before the RK stages, so the eddy viscosity stays frozen across
+    the stages of a single step (it is a function of the resolved spectrum,
+    which is only defined at the step boundaries).
+    """
+    cfg = state.cfg
+    if not cfg.les_active:
+        return None
+    if cfg.les_model == LESModel.CHOLLET_LESIEUR:
+        nu_t, info = chollet_lesieur_nu_t(state, fin)
+    else:  # pragma: no cover - guarded by the LESModel enum
+        raise ValueError(f"unknown LES model {cfg.les_model!r}")
+
+    # nu_mol is preserved explicitly: min(nu_mol + nu_t) is the plateau, not
+    # the molecular value the scale diagnostics need.
+    set_viscosity(state, state.nu_mol + nu_t, nu_mol=state.nu_mol)
+    state.les_info = info
+    return info
 
 
 def setup_viscosity(state: State) -> dict:

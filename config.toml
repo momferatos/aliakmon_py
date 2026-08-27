@@ -3,7 +3,7 @@
 # Booleans are true/false (not .true./.false.). Comments use '#'.
 
 [general]
-n = 128                   # collocation points per axis (power of two preferred)
+n = 32                    # collocation points per axis (power of two preferred)
 timesteps = 0              # number of timesteps; use tmax if 0
 tmax = 10.0               # maximum simulation time
 cfl = 0.8                # Courant-Friedrichs-Lewy number
@@ -20,6 +20,11 @@ burgers = false          # drop the pressure term? (Burgers eq.)
 forced = false            # force the hydro equations?
 variable_forcing = true   # true: Kaneda et al. (2004) negative-viscosity forcing
 kforcing = 2.5           # maximum forced wavenumber
+
+[les]
+les_model = 0            # 0: none (DNS), 1: Chollet-Lesieur spectral eddy viscosity
+les_ck = 1.4             # Kolmogorov constant; 1.4 gives the classic 0.267 plateau
+les_kc = 0.0             # cutoff wavenumber k_c; 0 -> the truncation k_max
 
 [numerics]
 integration_method = 2    # 1: RK2, 2: RK4
