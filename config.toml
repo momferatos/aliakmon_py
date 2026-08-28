@@ -34,8 +34,9 @@ les_pddles_model = ""    # pDDLES .pth checkpoint; required for les_model=2
 les_pddles_source = ""   # path to the pDDLES source tree (for lib/arch/<arch>.py)
 les_pddles_scaler = ""   # norm.pt/minmax.pt; default: alongside the training data.
                         # "auto" standardises with the field's own per-component
-                        # moments instead -- runnable without the fitted
-                        # constants, but NOT what the net was trained on.
+                        # moments instead; "none" disables normalisation
+                        # entirely. Both are runnable without the fitted
+                        # constants, but neither is what the net was trained on.
 les_pddles_device = "cpu"  # torch device for inference ("cpu", "cuda", ...)
 les_clip_backscatter = false  # zero tau_ij where it would feed energy back to
                         # the resolved scales; a stabiliser, off by default so

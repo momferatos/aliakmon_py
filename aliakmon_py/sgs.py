@@ -61,11 +61,14 @@ Three things follow, and each is a way to get silently wrong answers:
   training set and saved beside the data as ``norm.pt`` / ``minmax.pt``. They
   are loaded here and applied around the forward pass; without them the
   network sees inputs far outside its training range. ``les_pddles_scaler``
-  overrides the path if the data has moved, or takes the literal ``"auto"``
-  to stand in for a missing file by standardising each component with the
-  field's own mean and variance. ``"auto"`` tracks the running solution
-  rather than the training set, so it is for getting a run moving and for
-  diagnostics, not for production.
+  overrides the path if the data has moved, or takes one of two literals:
+  ``"auto"`` stands in for a missing file by standardising each component
+  with the field's own mean and variance, and ``"none"`` disables
+  normalisation outright. Both put the network outside the distribution it
+  was trained on -- ``"auto"`` tracks the running solution rather than the
+  training set, ``"none"`` skips the step entirely -- so they are for getting
+  a run moving and for diagnostics, not for production. Each warns when it
+  contradicts the checkpoint.
 * **The filter must match training.** ``k_c`` is derived from the checkpoint's
   ``alpha`` as ``alpha * sqrt(3)/2 * n``, so ``tau`` is built with the filter
   the network was trained against. Setting ``les_kc`` overrides this, which is
@@ -275,6 +278,16 @@ def _resolve_scaler(torch, ckpt_args, state, device):
     whose training data has since moved.
     """
     kind = getattr(ckpt_args, "scaler", "norm")
+
+    # 'none' disables normalisation: either because the network was trained
+    # that way, or because the config asks for it explicitly. The latter warns,
+    # since it puts the network outside the distribution it was trained on.
+    if state.cfg.les_pddles_scaler == "none" and kind != "none":
+        on_root("pDDLES: [les] les_pddles_scaler = 'none' — feeding the "
+                "network raw, unnormalised velocity even though it was "
+                f"trained behind the {kind!r} scaler. Its input is out of "
+                "distribution; tau should not be trusted.")
+        return None
     if kind == "none":
         return None
 
@@ -302,9 +315,10 @@ def _resolve_scaler(torch, ckpt_args, state, device):
             f"pDDLES: the checkpoint was trained with the {kind!r} scaler but "
             f"its constants were not found at {path!r}. That file is written "
             f"next to the training data, not into the checkpoint — copy it "
-            f"across and point [les] les_pddles_scaler at it. For a run "
-            f"without it, set les_pddles_scaler = \"auto\" to standardise "
-            f"with the field's own moments (diagnostic only).")
+            f"across and point [les] les_pddles_scaler at it. To run without "
+            f"it, set les_pddles_scaler to \"auto\" (standardise with the "
+            f"field's own moments) or \"none\" (no normalisation at all) — "
+            f"both diagnostic only.")
 
     blob = torch.load(path, map_location=device, weights_only=False)
     vals = blob["vals"]
