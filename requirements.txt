@@ -12,3 +12,8 @@ numba>=0.59           # @njit(parallel=True) pointwise kernels
 h5py>=3.10            # HDF5 field output
 # tomllib is in the Python 3.11+ stdlib; tomli is the backport for 3.10
 tomli>=2.0 ; python_version < "3.11"
+#
+# Optional: only needed for the pDDLES subgrid model ([les] les_model = 2),
+# which runs a trained TorchScript predictor. Left out of the default install
+# because it is a large dependency the DNS and eddy-viscosity paths never touch.
+#   pip install torch

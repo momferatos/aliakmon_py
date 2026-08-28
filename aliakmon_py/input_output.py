@@ -37,7 +37,10 @@ def _update_fscale(state: State, ke: float) -> None:
     broadcast is needed.
     """
     cfg = state.cfg
-    if not (cfg.forced and cfg.viscous and cfg.variable_forcing):
+    # Needs a sink for the injected energy: molecular viscosity, or a subgrid
+    # model of either family (an LES run may well set viscous = false).
+    if not (cfg.forced and cfg.variable_forcing
+            and (cfg.viscous or cfg.les_active)):
         return
     ke_prev = state._ke_prev
     if ke < KENTAR - _FORCING_TOL and ke <= ke_prev:
@@ -87,7 +90,12 @@ def compute_diagnostics(state: State) -> dict:
     nu = state.nu_mol
     ke = N.kinetic_energy(state)
     rmsu = math.sqrt(2.0 / 3.0 * ke) if ke > 0.0 else 1.0
-    emean = N.mean_dissipation(state) if state.cfg.diffusive else 0.0
+    # Total dissipation = resolved viscous drain + the subgrid transfer. A
+    # structural model drains through the RHS force, not through nu(k), so it
+    # is a separate term; eps_sgs is 0.0 unless such a model is running.
+    emean_visc = N.mean_dissipation(state) if state.cfg.diffusive else 0.0
+    eps_sgs = N.sgs_dissipation(state)
+    emean = emean_visc + eps_sgs
     ils, _ = N.integral_length_scale(state)
 
     # Taylor microscale and its Reynolds number use the dissipation estimate;
@@ -102,6 +110,7 @@ def compute_diagnostics(state: State) -> dict:
     return dict(
         maxdiv=N.incompressibility(state),
         ke=ke, rmsu=rmsu, emean=emean,
+        emean_visc=emean_visc, eps_sgs=eps_sgs,
         mkh=N.mean_kinetic_helicity(state),
         ils=ils, lam=lam, rel=rel, eta=eta, ett=ett, re=re,
         maxvel=getattr(state, "maxvel", 0.0),
@@ -157,8 +166,14 @@ def print_progress(state: State, ntimestep: int, t: float, dt: float,
     les = state.les_info
     if les is not None:
         print(bar)
-        print(f"| nu_mol {state.nu_mol:9.3e} | nu_t plateau {les['plateau']:9.3e}"
-              f" | cusp {les['peak']:9.3e} | E(k_c) {les['e_kc']:9.3e}")
+        if les["kind"] == "tensor":
+            print(f"| LES {les['model']} | k_c {les['kc']:7.2f}"
+                  f" | Delta {les['delta']:8.4f}"
+                  f" | eps_sgs {diag['eps_sgs']:+9.3e}"
+                  f" | eps_nu {diag['emean_visc']:9.3e}")
+        else:
+            print(f"| nu_mol {state.nu_mol:9.3e} | nu_t plateau {les['plateau']:9.3e}"
+                  f" | cusp {les['peak']:9.3e} | E(k_c) {les['e_kc']:9.3e}")
     print(star, flush=True)
 
     if hydro_log is not None:

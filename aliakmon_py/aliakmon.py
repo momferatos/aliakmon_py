@@ -23,6 +23,7 @@ from pathlib import Path
 from . import hdf5_io
 from . import initial_conditions as IC
 from . import numerics as N
+from . import sgs as SGS
 from .backend import IS_ROOT, backend_name, on_root
 from .data import State
 from .input_output import Progress, load_config, print_progress
@@ -46,11 +47,20 @@ def _banner(state: State, info: dict) -> None:
           f" | lambda {info['lambda_target']:10.3e}")
     print(f"| IC {cfg.initcond.name} | integration {cfg.integration_method.name}"
           f" | truncation {cfg.truncation.name}")
-    if cfg.les_active:
-        kc = cfg.les_kc if cfg.les_kc > 0.0 else state.kmax
+    if cfg.les_tensor:
+        # k_c normally comes from the checkpoint's alpha, which is only read
+        # once the predictor loads (after this banner) — so say where it will
+        # come from rather than printing a placeholder.
+        kc = (f"{cfg.les_kc:8.3f}" if cfg.les_kc > 0.0
+              else "from checkpoint alpha")
+        print(f"| LES {cfg.les_model.name} | k_c {kc}"
+              f" | clip {str(cfg.les_clip_backscatter).lower()}")
+        print(f"| predictor {cfg.les_pddles_model or '<unset>'}"
+              f" | device {cfg.les_pddles_device}")
+    elif cfg.les_active:
         print(f"| LES {cfg.les_model.name} | C_K {cfg.les_ck:5.3f} "
               f"| nu_t+ plateau {N.chollet_lesieur_plateau(cfg.les_ck):6.4f} "
-              f"| k_c {kc:8.3f}")
+              f"| k_c {SGS.cutoff_wavenumber(state):8.3f}")
     print("=" * 72, flush=True)
 
 
@@ -95,9 +105,9 @@ def main(config_path: str | Path = "config.toml") -> None:
         hdf5_io.write_field(state, time, nhdf5)
         nhdf5 += 1
 
-    # Seed nu_t(k) from the initial condition so the first step and the first
-    # diagnostics already carry the subgrid model.
-    N.update_eddy_viscosity(state)
+    # Seed the subgrid model from the initial condition so the first step and
+    # the first diagnostics already carry it.
+    N.update_subgrid_model(state)
 
     validator = DissipationTest(state) if cfg.valid else None
     hydro_log = open("hydro.dat", "w") if IS_ROOT else None
@@ -116,11 +126,11 @@ def main(config_path: str | Path = "config.toml") -> None:
             state._dt = dt
             N.timestep(state, dt)
 
-            # Refresh nu_t(k) from the spectrum of the field just produced, so
-            # it is frozen across the next step's RK stages and every
-            # diagnostic below sees a nu_t consistent with the current field.
+            # Refresh the subgrid model from the field just produced, so it is
+            # frozen across the next step's RK stages and every diagnostic
+            # below sees a subgrid term consistent with the current field.
             # No-op for DNS.
-            N.update_eddy_viscosity(state)
+            N.update_subgrid_model(state)
 
             if validator is not None:
                 validator.update(dt)

@@ -61,10 +61,26 @@ class Forcing(IntEnum):
 
 
 class LESModel(IntEnum):
-    """Subgrid model supplying the eddy viscosity (none = pure DNS)."""
+    """Subgrid model closing the filtered equations (none = pure DNS).
+
+    Two families, which enter the solver at completely different points:
+
+    * *functional* models represent the subgrid stress by an eddy viscosity
+      ``nu_t(k)``, which is folded into ``State.visc`` and rides along in the
+      existing diffusion term;
+    * *structural* models build the subgrid stress tensor ``tau_ij`` itself and
+      enter as the force ``-d(tau_ij)/dx_j`` added to the right-hand side. No
+      eddy viscosity is involved. See :mod:`aliakmon_py.sgs`.
+    """
 
     NONE = 0
-    CHOLLET_LESIEUR = 1
+    CHOLLET_LESIEUR = 1     # functional: spectral eddy viscosity
+    PDDLES = 2              # structural: predicted-field deconvolution LES
+
+
+# Which LES models supply an eddy viscosity, and which build a stress tensor.
+EDDY_VISCOSITY_MODELS = frozenset({LESModel.CHOLLET_LESIEUR})
+TENSOR_MODELS = frozenset({LESModel.PDDLES})
 
 
 # --------------------------------------------------------------------------
@@ -127,10 +143,17 @@ class Config:
     les_model: LESModel = LESModel.NONE
     les_ck: float = 1.4
     les_kc: float = 0.0
+    # pDDLES only; ignored by the eddy-viscosity models.
+    les_pddles_model: str = ""
+    les_pddles_source: str = ""
+    les_pddles_scaler: str = ""
+    les_pddles_device: str = "cpu"
+    les_clip_backscatter: bool = False
 
     # [numerics]
     integration_method: Integration = Integration.RUNGE_KUTTA4
     truncation: Truncation = Truncation.POLYHEDRAL
+    truncation_kc: float = 0.0
     dealiasing: Dealiasing = Dealiasing.PATTERSON_ORSZAG
 
     # [initialconditions]
@@ -160,17 +183,29 @@ class Config:
 
     @property
     def les_active(self) -> bool:
-        """True when a subgrid model contributes an eddy viscosity."""
+        """True when any subgrid model is running."""
         return self.les_model != LESModel.NONE
 
     @property
-    def diffusive(self) -> bool:
-        """True when the RHS carries a diffusion term at all.
+    def les_eddy_viscosity(self) -> bool:
+        """True for a functional model that contributes ``nu_t(k)``."""
+        return self.les_model in EDDY_VISCOSITY_MODELS
 
-        An LES run supplies a viscosity even with ``viscous = false`` (no
-        molecular part), so the diffusive term must not be skipped then.
+    @property
+    def les_tensor(self) -> bool:
+        """True for a structural model that builds ``tau_ij`` explicitly."""
+        return self.les_model in TENSOR_MODELS
+
+    @property
+    def diffusive(self) -> bool:
+        """True when the RHS carries a ``nu(k) k^2`` diffusion term at all.
+
+        An eddy-viscosity LES supplies a viscosity even with ``viscous = false``
+        (no molecular part), so the diffusive term must not be skipped then. A
+        structural model never touches ``nu(k)`` — it adds a separate subgrid
+        force — so there ``viscous = false`` really does mean no diffusion.
         """
-        return self.viscous or self.les_active
+        return self.viscous or self.les_eddy_viscosity
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "Config":

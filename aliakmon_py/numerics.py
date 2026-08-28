@@ -18,6 +18,7 @@ import math
 import numpy as np
 
 from . import kernels as K
+from . import sgs as SGS
 from .backend import (allreduce_array, allreduce_max, allreduce_min,
                       allreduce_sum)
 from .data import State
@@ -106,11 +107,18 @@ def compute_rhs(state: State, fin) -> None:
     # Remove aliased modes.
     state.apply_truncation_mask(fnl)
 
-    # Diffusive term and assemble RHS: rhs = nl - nu(k) k^2 fu + f_forcing.
+    # Diffusive term and assemble RHS: rhs = nl - nu(k) k^2 fu + f_sgs + f_forcing.
     for c in range(3):
         state.rhs[c][...] = fnl[c]
         if cfg.diffusive:
             K.add_viscous(state.rhs[c], fin[c], state.visc[c], state.K2)
+
+    # Structural subgrid model: the force -d(tau_ij)/dx_j, held fixed across
+    # this step's RK substages (refreshed by update_subgrid_model). Added
+    # before the projection, which disposes of tau's isotropic part.
+    if cfg.les_tensor:
+        for c in range(3):
+            state.rhs[c] += state.fsgs[c]
 
     if cfg.forced:
         _apply_forcing(state, fin)
@@ -227,6 +235,37 @@ def mean_dissipation(state: State, fin=None) -> float:
         f = state.fu[c] if fin is None else fin[c]
         e = np.abs(f) ** 2
         local += float(np.sum(state.visc[c] * weight * state.K2 * e))
+    return allreduce_sum(local)
+
+
+def sgs_dissipation(state: State) -> float:
+    """Energy drained from the resolved scales by the structural subgrid force.
+
+    ``eps_sgs = -sum_k w Re(u_hat* . f_hat)`` in the same Fourier-space
+    convention as :func:`mean_dissipation`, so that
+
+        dE/dt = -(eps_visc + eps_sgs)
+
+    closes the budget checked by :mod:`aliakmon_py.validation`. Positive means
+    the model removes energy; unlike an eddy viscosity it may legitimately go
+    negative (backscatter) unless ``les_clip_backscatter`` is on.
+
+    Reads the force cached in ``state.fsgs``, which
+    :func:`update_subgrid_model` refreshed from the current ``state.fu`` — so
+    this is exact and costs no transforms. Returns 0.0 without a tensor model.
+
+    The *unprojected* force is used deliberately: the resolved field is
+    solenoidal, so the pressure part the projection would remove is orthogonal
+    to it and contributes nothing to the transfer.
+    """
+    if not state.cfg.les_tensor:
+        return 0.0
+    weight = _hermitian_weight(state)
+    local = 0.0
+    for c in range(NFIELDS):
+        u, f = state.fu[c], state.fsgs[c]
+        # Re(conj(u) * f), without materialising a complex temporary.
+        local -= float(np.sum(weight * (u.real * f.real + u.imag * f.imag)))
     return allreduce_sum(local)
 
 
@@ -393,7 +432,7 @@ def chollet_lesieur_nu_t(state: State, fin=None) -> tuple:
     global reduction; call it once per timestep rather than per RK stage.
     """
     cfg = state.cfg
-    kc = float(cfg.les_kc) if cfg.les_kc > 0.0 else float(state.kmax)
+    kc = SGS.cutoff_wavenumber(state)
 
     k, e = energy_spectrum(state, fin)
     # E(k_c) from the shell straddling the cutoff, clamped to the last bin.
@@ -408,22 +447,37 @@ def chollet_lesieur_nu_t(state: State, fin=None) -> tuple:
     ratio = np.divide(kc, kmag, out=np.full_like(kmag, np.inf), where=kmag > 0)
     nu_t = amp * (1.0 + _CUSP_AMP * np.exp(-_CUSP_DECAY * ratio))
 
-    info = dict(kc=kc, e_kc=e_kc, plateau=amp,
+    info = dict(kind="eddy_viscosity", kc=kc, e_kc=e_kc, plateau=amp,
                 peak=amp * (1.0 + _CUSP_AMP * math.exp(-_CUSP_DECAY)))
     return nu_t, info
 
 
-def update_eddy_viscosity(state: State, fin=None) -> dict | None:
-    """Refresh ``state.visc`` with nu_mol + nu_t(k) for the configured model.
+def update_subgrid_model(state: State, fin=None) -> dict | None:
+    """Refresh whatever the configured subgrid model contributes.
 
-    A no-op returning ``None`` when no subgrid model is active. Call once per
-    timestep, before the RK stages, so the eddy viscosity stays frozen across
-    the stages of a single step (it is a function of the resolved spectrum,
-    which is only defined at the step boundaries).
+    Two disjoint jobs, depending on the model family:
+
+    * *functional* (eddy viscosity) — recompute ``nu_t(k)`` and fold it into
+      ``state.visc``;
+    * *structural* (tensor) — rebuild the subgrid force ``state.fsgs`` from the
+      stress ``tau_ij`` (:mod:`aliakmon_py.sgs`).
+
+    Either way this runs once per timestep rather than per RK substage, so the
+    subgrid contribution stays frozen across the stages of a single step. For
+    the eddy viscosity that avoids a spectrum reduction per stage; for pDDLES
+    it avoids four network evaluations per step. Both are O(dt) approximations.
+
+    A no-op returning ``None`` for a pure DNS run.
     """
     cfg = state.cfg
     if not cfg.les_active:
         return None
+
+    if cfg.les_tensor:
+        SGS.subgrid_force(state, fin)
+        state.les_info = SGS.sgs_info(state)
+        return state.les_info
+
     if cfg.les_model == LESModel.CHOLLET_LESIEUR:
         nu_t, info = chollet_lesieur_nu_t(state, fin)
     else:  # pragma: no cover - guarded by the LESModel enum

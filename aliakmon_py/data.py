@@ -99,6 +99,43 @@ class State:
         self.psu_real = _triple_real(self.T)
         self.fnls = _triple_cmplx(self.T)
 
+        # Structural subgrid model scratch (aliakmon_py.sgs). None unless such
+        # a model runs, so DNS and eddy-viscosity runs pay nothing for it.
+        self.sgs_ubar = self.sgs_ustar = self.sgs_tau = None
+        self.sgs_tau_hat = self.sgs_grad = self.sgs_cmplx = None
+        self.fsgs = None
+        if cfg.les_tensor:
+            self._alloc_tensor_sgs()
+
+    # ------------------------------------------------------------------
+    # Structural subgrid-model buffers
+    # ------------------------------------------------------------------
+    def _alloc_tensor_sgs(self) -> None:
+        """Allocate the work buffers a structural (tensor) LES model needs.
+
+        Symmetric tensors are stored as six components in the order
+        ``(11, 12, 13, 22, 23, 33)``, matching the kernel signatures; the
+        velocity gradient ``sgs_grad[i][j]`` is ``dU_i/dx_j``.
+
+        This is 12 extra real fields (21 with the backscatter clip) and 10
+        complex ones per rank — roughly a doubling of the solver's footprint,
+        which is the price of carrying a stress tensor rather than a scalar
+        eddy viscosity.
+        """
+        T = self.T
+        self.sgs_ubar = _triple_real(T)     # resolved velocity, physical space
+        self.sgs_ustar = _triple_real(T)    # predicted full field u*
+        self.sgs_tau = [np.zeros(T.real_shape, dtype=np.float64)
+                        for _ in range(6)]
+        self.sgs_tau_hat = [np.zeros(T.cmplx_shape, dtype=np.complex128)
+                            for _ in range(6)]
+        self.fsgs = _triple_cmplx(T)        # subgrid force, Fourier space
+        self.sgs_cmplx = np.zeros(T.cmplx_shape, dtype=np.complex128)
+        # The resolved strain is only needed to decide where to clip.
+        if self.cfg.les_clip_backscatter:
+            self.sgs_grad = [[np.zeros(T.real_shape, dtype=np.float64)
+                              for _ in range(3)] for _ in range(3)]
+
     # ------------------------------------------------------------------
     # Active-mode mask (alloc_init loop + *_tr criteria in data.f90)
     # ------------------------------------------------------------------
@@ -126,6 +163,21 @@ class State:
             self.kmax = TRFAC * n
         else:  # pragma: no cover - guarded by the Truncation enum
             raise ValueError(f"unknown truncation {trunc!r}")
+
+        # Optional explicit spectral cutoff, applied on top of the scheme's
+        # own limit. An LES closed by a subgrid model that was *trained* at a
+        # particular filter width has to evolve exactly that band, or the
+        # model sees fields unlike anything in its training set; the stock
+        # schemes are all tied to n and cannot express an arbitrary k_c.
+        #
+        # `self.kmax` is deliberately left at the scheme's nominal value: it
+        # stands for the grid's resolving power, which is what sets the
+        # molecular viscosity in `setup_viscosity` and the `kmax*eta`
+        # diagnostic. Those must keep describing the underlying DNS
+        # resolution, not the (much lower) LES cutoff.
+        ktrunc = float(self.cfg.truncation_kc)
+        if ktrunc > 0.0:
+            truncated = truncated | (np.sqrt(self.K2) > ktrunc)
 
         # Broadcast to the full local Fourier shape and store as 0/1 for
         # cheap in-place masking in the kernels.

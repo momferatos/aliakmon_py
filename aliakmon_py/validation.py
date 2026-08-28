@@ -32,8 +32,9 @@ class DissipationTest:
 
     def __init__(self, state: State):
         self.state = state
-        # Any diffusion term (molecular and/or subgrid) removes energy.
-        self.viscous = bool(state.cfg.diffusive)
+        # Anything that removes energy: the nu(k) k^2 diffusion term and/or a
+        # structural subgrid model's force.
+        self.dissipative = bool(state.cfg.diffusive or state.cfg.les_tensor)
         # Rolling samples of (kinetic energy, dissipation rate).
         self._energy: list[float] = []
         self._eps: list[float] = []
@@ -42,12 +43,14 @@ class DissipationTest:
 
     def update(self, dt: float):
         """Record the current state and report the conservation residual."""
+        cfg = self.state.cfg
         ke = N.kinetic_energy(self.state)
-        eps = N.mean_dissipation(self.state) if self.viscous else 0.0
+        eps = N.mean_dissipation(self.state) if cfg.diffusive else 0.0
+        eps += N.sgs_dissipation(self.state)  # 0.0 without a structural model
         self._energy.append(ke)
         self._eps.append(eps)
 
-        if self.viscous:
+        if self.dissipative:
             return self._viscous_residual(dt)
         return self._inviscid_residual(ke)
 

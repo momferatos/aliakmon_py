@@ -22,9 +22,24 @@ variable_forcing = true   # true: Kaneda et al. (2004) negative-viscosity forcin
 kforcing = 2.5           # maximum forced wavenumber
 
 [les]
-les_model = 0            # 0: none (DNS), 1: Chollet-Lesieur spectral eddy viscosity
+les_model = 0            # 0: none (DNS), 1: Chollet-Lesieur eddy viscosity,
+                        # 2: pDDLES (predicted-field subgrid stress tensor)
 les_ck = 1.4             # Kolmogorov constant; 1.4 gives the classic 0.267 plateau
 les_kc = 0.0             # cutoff wavenumber k_c; 0 -> the truncation k_max
+# pDDLES only; see the checkpoint contract in aliakmon_py/sgs.py.
+# The .pth carries its own training args, so the architecture and the filter
+# cutoff alpha are read from it -- do NOT restate them here. Note les_kc above
+# overrides the alpha-derived cutoff, which is usually a mistake.
+les_pddles_model = ""    # pDDLES .pth checkpoint; required for les_model=2
+les_pddles_source = ""   # path to the pDDLES source tree (for lib/arch/<arch>.py)
+les_pddles_scaler = ""   # norm.pt/minmax.pt; default: alongside the training data.
+                        # "auto" standardises with the field's own per-component
+                        # moments instead -- runnable without the fitted
+                        # constants, but NOT what the net was trained on.
+les_pddles_device = "cpu"  # torch device for inference ("cpu", "cuda", ...)
+les_clip_backscatter = false  # zero tau_ij where it would feed energy back to
+                        # the resolved scales; a stabiliser, off by default so
+                        # the trained model's backscatter is kept
 
 [numerics]
 integration_method = 2    # 1: RK2, 2: RK4

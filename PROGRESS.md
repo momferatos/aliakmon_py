@@ -113,10 +113,11 @@ Two interop gotchas:
     `nu_t(k) = A (1 + 34.5 exp(-3.03 k_c/k)) sqrt(E(k_c)/k_c)` with plateau
     `A = 0.441 C_K^(-3/2)` (= 0.267 at C_K=1.4, reproducing the published
     `0.267 + 9.21 exp(-3.03/x)` to 0.3%). Cusp is 2.667x the plateau at `k_c`.
-  - `numerics.update_eddy_viscosity`: sets `visc = nu_mol + nu_t`, called once
-    per step from `aliakmon.main` *after* `timestep`, so nu_t is frozen across
-    the RK stages and every diagnostic sees a nu_t consistent with the current
-    field. `E(k_c)` costs one global reduction — do not call it per RK stage.
+  - `numerics.update_subgrid_model` (was `update_eddy_viscosity`, renamed when
+    pDDLES arrived): sets `visc = nu_mol + nu_t`, called once per step from
+    `aliakmon.main` *after* `timestep`, so nu_t is frozen across the RK stages
+    and every diagnostic sees a nu_t consistent with the current field.
+    `E(k_c)` costs one global reduction — do not call it per RK stage.
   - `Config.les_active` / `Config.diffusive`: the diffusion term and the
     dissipation diagnostics key off `diffusive`, so `viscous=false` + LES
     (pure eddy viscosity, no molecular part) still works.
@@ -127,9 +128,107 @@ Two interop gotchas:
   budget residual while nu_t first ramps up — that is the O(dt) cost of
   freezing nu_t across a step, not an accounting error.
 
+- `pDDLES` — **structural** subgrid model: builds the SGS stress tensor
+  explicitly instead of an eddy viscosity (`aliakmon_py/sgs.py`, NOT in the
+  Fortran). Predicts the full field from the resolved large scales with a
+  trained PyTorch net, then filters:
+      u*     = Predictor(U)                      (TorchScript checkpoint)
+      tau_ij = G*(u*_i u*_j) - U_i U_j
+      f_i    = -d(tau_ij)/dx_j   ->   f_hat_i = -i k_j tau_hat_ij
+  `f` is added to the RHS *before* the pressure projection, which disposes of
+  tau's isotropic part — no trace subtraction needed. Because `U` is
+  solenoidal, the projection is orthogonal to it, so `eps_sgs` computed from
+  the *unprojected* force is exact.
+  - Model families now split: `Config.les_eddy_viscosity` (functional, folds
+    `nu_t(k)` into `visc`) vs `Config.les_tensor` (structural, adds a force).
+    `Config.diffusive` keys off the *eddy-viscosity* one only, so
+    `viscous=false` + pDDLES is a genuinely diffusion-free run.
+  - `numerics.sgs_dissipation`: `eps_sgs = -sum_k w Re(u_hat* . f_hat)`, added
+    to the budget in `validation.py` so `dE/dt + eps_visc + eps_sgs ~ 0` still
+    closes. May legitimately go NEGATIVE (backscatter) — that is the whole
+    point of not using an eddy viscosity, and an eddy viscosity cannot do it.
+  - The net is not MPI-decomposed: inference runs on the field gathered to
+    root and is scattered back (like `hdf5_io`, simplicity over scalability).
+    Verified: the SGS force checksum is bit-identical at 1, 2 and 4 ranks.
+  - Stress is built once per step and frozen across the RK substages (same
+    compromise as nu_t) — 4 net evaluations per step would otherwise dominate.
+    Measured budget residual is cleanly O(dt): 1.71e-3 -> 8.66e-4 -> ... as dt
+    halves. Do NOT read that residual as an accounting error.
+  - `les_clip_backscatter` zeroes tau where `-tau_ij S_ij < 0`. Off by default
+    so the trained model's backscatter is kept; turn it on if a run goes
+    unstable. Measured: eps_sgs -5.5e-4 (net backscatter) unclipped vs +0.17
+    clipped, i.e. the clip is what makes the closure net-dissipative.
+  Enable with `[les] les_model=2 les_pddles_model="<Epoch_NNN>.pth"
+  les_pddles_source="/home/giorgos/src/pDDLES"`.
+
+  Loading the real pDDLES artifacts (checked against that tree, NOT guessed):
+  - Weights are `.pth` **state_dicts**, not TorchScript: `trainer.save` writes
+    `dict(epoch, model, optimizer, args)`. The checkpoint is SELF-DESCRIBING —
+    the training `argparse.Namespace` rides along — so the architecture, its
+    hyper-parameters and `alpha` are read from the file, not from config.toml.
+    Load with `weights_only=False` (it holds a Namespace).
+  - The architecture is imported from the pDDLES tree (`lib/arch/<arch>.py`)
+    via `les_pddles_source`; ALIAKMON does not vendor it. `args.actfun` and
+    `args.batchnorm` are pickled live objects, so the Namespace reconstructs
+    the net exactly. Only `device`/`dev`/`noload`/`copy` are overridden.
+  - **The scaler is NOT in the checkpoint** and is NOT optional. pDDLES
+    normalises outside the net (`trainer.train_one_epoch`):
+        X_s = (X - X_mean)/X_std;  pred = model(X_s);  u* = y_std*pred + y_mean
+    The fitted constants live beside the *training data* (`args.h5path`) as
+    `norm.pt`/`minmax.pt`, per-component shape `(1,3,1,1,1)`. Skipping them
+    feeds the net inputs far outside its training range. `les_pddles_scaler`
+    overrides the path. NOTE: no `norm.pt` exists on this machine — it must be
+    copied from wherever the model was trained.
+  - `les_pddles_scaler = "auto"` is the stand-in for a missing `norm.pt`:
+    it standardises each component with the *field's own* mean and variance
+    every call (verified: zero mean, unit variance to the float32 floor), and
+    unscales with the same constants so an identity network round-trips.
+    It follows the running solution rather than the training set, so it is a
+    get-it-running/diagnostic path, not production. It warns once on root.
+  - `k_c` is DERIVED from the checkpoint's `alpha`, so tau is built with the
+    filter the net was trained against. pDDLES measures wavenumbers in
+    cycles/sample (`torch.fft.fftfreq`), where the grid corner is `sqrt(3)/2`
+    and `_les_filter_mask` keeps `|k|/n <= alpha*sqrt(3)/2`; in this solver's
+    integer wavenumbers that is `k_c = alpha * sqrt(3)/2 * n`. Setting
+    `les_kc` overrides it, which is usually a mistake.
+  - The net is resolution-specific (spectral coefficients indexed by a fixed
+    wavenumber grid), so the run's `n` must equal the checkpoint's; enforced.
+  torch is an optional dependency; nothing else in the port imports it.
+
+- `32^3 pDDLES LES` — first run against a real checkpoint. Config + outputs in
+  `runs/pddles32-fnet8/` (gitignored). torch 2.13.0+cpu is now installed in
+  `.venv`. Predictor: `FNet32-8/weights/FNet32-8/Epoch_029.pth` (30 epochs,
+  8 blocks, n=32, alpha=0.1, scaler='norm').
+  - `alpha=0.1` => `k_c = alpha*sqrt(3)/2*n = 2.7713`, so the resolved band is
+    only shells 0,1,2 (`k_max_active=2.449`, **51 modes** on the 32^3 grid).
+    `[numerics] truncation_kc = 2.7713` evolves exactly that band, which is
+    what the net was trained to receive; without it the net gets input with
+    energy where training inputs were identically zero (a warning fires).
+  - `truncation_kc` masks only — `state.kmax` stays at the scheme's nominal
+    15.085, because that is the grid's resolving power and is what sets nu in
+    `setup_viscosity` and the `kmax*eta` diagnostic. Do NOT collapse the two.
+  - Old checkpoints predate `precision`/`torch_dtype` in `pDDLES.py:main`;
+    `sgs._backfill_args` re-derives the missing Namespace fields (never
+    overriding what a checkpoint carries).
+  - Result: 200 steps to t=10 in 65 s (~0.32 s/step, of which ~0.17 s is the
+    network). Budget closes: mean 0.029%, worst 0.067%. div ~1e-16. KE decays
+    0.500 -> 0.132, Re_lambda 31 -> 14.
+  - **OPEN ISSUE:** `eps_sgs` is only 0.7-2.2% of the molecular dissipation
+    and flips sign constantly (113 steps forward-scatter, 88 backscatter,
+    range -9.3e-4 .. +7.6e-4) — i.e. the closure is nearly transfer-neutral.
+    That is implausibly small for a cutoff that discards ~85% of the
+    wavenumber range. Prime suspect is the stand-in scaler: measured directly,
+    `rms(G*u*)` comes back ~25% BELOW `rms(U)`, so the reconstruction is well
+    off in the resolved band alone. Get the real `norm.pt` before drawing any
+    conclusion about the model.
+
 ## TODO (next)
 The hydro port is feature-complete and runnable (decaying AND forced
-turbulence, DNS or Chollet-Lesieur LES).
+turbulence; DNS, Chollet-Lesieur eddy-viscosity LES, or pDDLES tensor LES).
+pDDLES has NOT yet been run against a real trained checkpoint — it was verified
+with NumPy and fake-torch stubs (`sgs._predict` / `sys.modules["torch"]` are
+the injection points). First real run: check `eps_sgs` in the progress box has
+a sane magnitude and sign before trusting a long integration.
 Possible follow-ups:
 energy spectrum file per output frame (`output_spectra`), 2D slice output
 (`output_slices`), dissipation-peak detection / `stop_at_disspeak`, gzip
@@ -154,6 +253,29 @@ compression on HDF5, collective parallel HDF5 (currently gather-to-root).
    magnitude scalar in every output frame (matches the Fortran to ~1e-6); color
    by `w` (or use a Q-criterion / Curl filter on `u`). At Re_lambda~27 (n=32)
    the flow is genuinely low-Re and only mildly structured regardless.
+10. Testing a subgrid model needs a BROADBAND field. Taylor-Green is
+   spectrally compact (k=1 only, so u_i u_j lands at k=2, far inside the
+   cutoff): `G*(u_i u_j) == u_i u_j`, tau is identically zero and every SGS
+   test passes vacuously. The stochastic ICs are broadband but seed per rank,
+   so serial and MPI results are NOT comparable. Use a deterministic analytic
+   superposition spanning k=1..7 (see the pDDLES test harness).
+11. An identity prediction (`u* == U`) must give ZERO SGS energy transfer —
+   no predicted subgrid scales, no transfer. It is the model's consistency
+   limit, and a useful check, but it cannot validate the pipeline (tau is
+   non-zero in physical space; only `eps_sgs` vanishes, since the deviatoric
+   trace subtraction leaves a pure gradient in the force that the solenoidal
+   resolved field cannot see).
+12. `tau_ij = G*(u*_i u*_j) - G*(u*_i) G*(u*_j)` — BOTH terms from the
+   prediction (pDDLES `TurbDataset.subgrid_scale_tensor`). Substituting the
+   solver's own `U` for `G*u*` looks equivalent, since the net is trained so
+   `G*u* ~ U`, but the difference is exactly the reconstruction error and it
+   enters tau as a spurious stress instead of cancelling.
+13. A cutoff that is *reported* is not necessarily *applied*. `_filter_mask`
+   once keyed off `cfg.les_kc` alone, so the alpha-derived `k_c` was computed,
+   broadcast and printed in the progress box while the filter silently stayed
+   at the full truncation — correct-looking banner, wrong tau, `eps_sgs` at
+   round-off. Regression test: a derived `k_c` must keep strictly fewer modes
+   than `state.mask`.
 8. Stochastic IC spectra (initial_conditions.py): Fortran `random_field(kmax)`
    is a FLAT spectrum with a hard cutoff |k|<kmax AND only modes with all three
    wavenumber components nonzero (so kmax=2 → only the (+-1,+-1,+-1) modes, a
