@@ -32,11 +32,12 @@ les_kc = 0.0             # cutoff wavenumber k_c; 0 -> the truncation k_max
 # overrides the alpha-derived cutoff, which is usually a mistake.
 les_pddles_model = ""    # pDDLES .pth checkpoint; required for les_model=2
 les_pddles_source = ""   # path to the pDDLES source tree (for lib/arch/<arch>.py)
-les_pddles_scaler = ""   # norm.pt/minmax.pt; default: alongside the training data.
-                        # "auto" standardises with the field's own per-component
-                        # moments instead; "none" disables normalisation
-                        # entirely. Both are runnable without the fitted
-                        # constants, but neither is what the net was trained on.
+les_pddles_scaler = ""   # leave empty: the normalisation constants travel
+                        # inside the checkpoint. "auto" standardises with the
+                        # field's own per-component moments instead; "none"
+                        # disables normalisation entirely. Both are runnable
+                        # without the fitted constants, but neither is what the
+                        # net was trained on. A file path is no longer accepted.
 les_pddles_device = "cpu"  # torch device for inference ("cpu", "cuda", ...)
 les_clip_backscatter = false  # zero tau_ij where it would feed energy back to
                         # the resolved scales; a stabiliser, off by default so

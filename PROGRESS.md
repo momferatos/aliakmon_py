@@ -171,15 +171,22 @@ Two interop gotchas:
     via `les_pddles_source`; ALIAKMON does not vendor it. `args.actfun` and
     `args.batchnorm` are pickled live objects, so the Namespace reconstructs
     the net exactly. Only `device`/`dev`/`noload`/`copy` are overridden.
-  - **The scaler is NOT in the checkpoint** and is NOT optional. pDDLES
+  - **The scaler RIDES IN the checkpoint** and is NOT optional. pDDLES
     normalises outside the net (`trainer.train_one_epoch`):
         X_s = (X - X_mean)/X_std;  pred = model(X_s);  u* = y_std*pred + y_mean
-    The fitted constants live beside the *training data* (`args.h5path`) as
-    `norm.pt`/`minmax.pt`, per-component shape `(1,3,1,1,1)`. Skipping them
-    feeds the net inputs far outside its training range. `les_pddles_scaler`
-    overrides the path. NOTE: no `norm.pt` exists on this machine — it must be
-    copied from wherever the model was trained.
-  - `les_pddles_scaler = "auto"` is the stand-in for a missing `norm.pt`:
+    Since pDDLES commit 6777e04 ("Embed normalization constants in
+    checkpoints, drop norm.pt") `trainer.save` writes
+    `scaler=self.scaler.state_dict()` into the .pth, so the constants travel
+    with the weights: `{X_mean,X_std,y_mean,y_std}` for NormScaler,
+    `{X_min,X_max,y_min,y_max}` for MinmaxScaler, `{}` for DummyScaler, each
+    per-component shape `(1,3,1,1,1)`. Skipping them feeds the net inputs far
+    outside its training range.
+    Those checkpoints also DROP `args.h5path` — nothing external is needed.
+    ALIAKMON reads only the embedded state: the standalone `norm.pt` /
+    `minmax.pt` files are no longer loaded, and a checkpoint with no `scaler`
+    key is REJECTED (re-export it from a current pDDLES). `les_pddles_scaler`
+    no longer takes a path — only `""`, `"auto"` or `"none"`.
+  - `les_pddles_scaler = "auto"` is the stand-in when constants are absent:
     it standardises each component with the *field's own* mean and variance
     every call (verified: zero mean, unit variance to the float32 floor), and
     unscales with the same constants so an identity network round-trips.
@@ -219,16 +226,21 @@ Two interop gotchas:
     That is implausibly small for a cutoff that discards ~85% of the
     wavenumber range. Prime suspect is the stand-in scaler: measured directly,
     `rms(G*u*)` comes back ~25% BELOW `rms(U)`, so the reconstruction is well
-    off in the resolved band alone. Get the real `norm.pt` before drawing any
-    conclusion about the model.
+    off in the resolved band alone. Get the real constants before drawing any
+    conclusion about the model. UPDATE: those constants are now available —
+    they ride in the checkpoint (see the scaler bullet above), so this is
+    re-testable without hunting for a `norm.pt`. Not yet re-measured against a
+    fully-trained embedded-scaler checkpoint.
 
 ## TODO (next)
 The hydro port is feature-complete and runnable (decaying AND forced
 turbulence; DNS, Chollet-Lesieur eddy-viscosity LES, or pDDLES tensor LES).
-pDDLES has NOT yet been run against a real trained checkpoint — it was verified
-with NumPy and fake-torch stubs (`sgs._predict` / `sys.modules["torch"]` are
-the injection points). First real run: check `eps_sgs` in the progress box has
-a sane magnitude and sign before trusting a long integration.
+pDDLES HAS now been run against real trained checkpoints (torch 2.13.0+cpu is
+installed in `.venv`): n=32 and n=64, serial and under MPI, budget closing to
+0.1-2.5%, `eps_sgs` bitwise rank-independent at n=32 (1e-14 at n=64, inherited
+from the distributed FFT). Still outstanding: every such run used a
+lightly-trained or old-format checkpoint, so `eps_sgs` magnitude is not yet
+trustworthy — see the OPEN ISSUE above.
 Possible follow-ups:
 energy spectrum file per output frame (`output_spectra`), 2D slice output
 (`output_slices`), dissipation-peak detection / `stop_at_disspeak`, gzip

@@ -56,19 +56,21 @@ Three things follow, and each is a way to get silently wrong answers:
 
 * **The architecture is imported from the pDDLES tree**, ``lib/arch/<arch>.py``
   — point ``les_pddles_source`` at a checkout. ALIAKMON does not vendor it.
-* **The scaler is not in the checkpoint.** pDDLES normalises outside the
+* **The scaler rides in the checkpoint.** pDDLES normalises outside the
   network (``trainer.train_one_epoch``), with constants fitted over the
-  training set and saved beside the data as ``norm.pt`` / ``minmax.pt``. They
-  are loaded here and applied around the forward pass; without them the
-  network sees inputs far outside its training range. ``les_pddles_scaler``
-  overrides the path if the data has moved, or takes one of two literals:
-  ``"auto"`` stands in for a missing file by standardising each component
-  with the field's own mean and variance, and ``"none"`` disables
-  normalisation outright. Both put the network outside the distribution it
-  was trained on -- ``"auto"`` tracks the running solution rather than the
-  training set, ``"none"`` skips the step entirely -- so they are for getting
-  a run moving and for diagnostics, not for production. Each warns when it
-  contradicts the checkpoint.
+  training set; ``trainer.save`` writes them alongside the weights under a
+  ``scaler`` key, so they travel with the network and are applied around the
+  forward pass here. Without them the network sees inputs far outside its
+  training range. A checkpoint predating that change carries no ``scaler``
+  key and is rejected -- the standalone ``norm.pt`` / ``minmax.pt`` files that
+  used to hold the constants are no longer read, so re-export it from a
+  current pDDLES. ``les_pddles_scaler`` takes one of two literals for
+  diagnostic runs: ``"auto"`` standardises each component with the field's
+  own mean and variance, and ``"none"`` disables normalisation outright. Both
+  put the network outside the distribution it was trained on -- ``"auto"``
+  tracks the running solution rather than the training set, ``"none"`` skips
+  the step entirely -- so they are for getting a run moving, not for
+  production. Each warns when it contradicts the checkpoint.
 * **The filter must match training.** ``k_c`` is derived from the checkpoint's
   ``alpha`` as ``alpha * sqrt(3)/2 * n``, so ``tau`` is built with the filter
   the network was trained against. Setting ``les_kc`` overrides this, which is
@@ -269,21 +271,57 @@ def _standardise(u: np.ndarray):
     return (u - mean) / std, mean, std
 
 
-def _resolve_scaler(torch, ckpt_args, state, device):
-    """Load the normalisation constants the checkpoint was trained with.
+# Key sets written by the scaler ``state_dict`` methods in the pDDLES tree
+# (lib/scaler/Scaler.py): NormScaler stores moments, MinmaxScaler stores
+# bounds, DummyScaler stores nothing at all.
+_NORM_KEYS = ("X_mean", "X_std", "y_mean", "y_std")
+_MINMAX_KEYS = ("X_min", "X_max", "y_min", "y_max")
 
-    ``args.scaler`` names the scheme; the fitted constants live beside the
-    training data (``args.h5path``) in ``norm.pt`` / ``minmax.pt``, not in the
-    checkpoint. ``les_pddles_scaler`` overrides that path for a checkpoint
-    whose training data has since moved.
+
+def _scaler_from_state(torch, sd, device):
+    """Convert a pDDLES scaler ``state_dict`` into the predictor's 4-tuple.
+
+    Both schemes reduce to the same ``(x_bias, x_range, y_bias, y_range)``
+    algebra the forward pass applies. ``DummyScaler`` writes an empty dict,
+    which means "no normalisation" and maps to ``None``.
     """
+    if not sd:
+        return None
+
+    def _t(v):
+        return torch.as_tensor(v).to(device)
+
+    if all(k in sd for k in _NORM_KEYS):
+        return tuple(_t(sd[k]) for k in _NORM_KEYS)
+    if all(k in sd for k in _MINMAX_KEYS):
+        x_min, x_max, y_min, y_max = (_t(sd[k]) for k in _MINMAX_KEYS)
+        return (x_min, x_max - x_min, y_min, y_max - y_min)
+    raise ValueError(
+        f"pDDLES: unrecognised scaler state in the checkpoint. Expected the "
+        f"keys {_NORM_KEYS} or {_MINMAX_KEYS}, found {sorted(sd)}.")
+
+
+def _resolve_scaler(torch, ckpt, state, device):
+    """Resolve the normalisation constants the checkpoint was trained with.
+
+    pDDLES checkpoints carry them: ``trainer.save`` writes
+    ``scaler=self.scaler.state_dict()`` beside the weights, so the constants
+    travel with the network and nothing external is read. ``args.scaler``
+    still names the scheme, and is used only to describe the checkpoint in
+    diagnostics.
+
+    ``les_pddles_scaler`` takes the literals ``"auto"`` / ``"none"``, which
+    replace or skip the embedded constants for diagnostic runs.
+    """
+    ckpt_args = ckpt.get("args")
     kind = getattr(ckpt_args, "scaler", "norm")
+    override = state.cfg.les_pddles_scaler
 
     # 'none' disables normalisation: either because the network was trained
     # that way, or because the config asks for it explicitly. The latter warns,
     # since it puts the network outside the distribution it was trained on.
-    if state.cfg.les_pddles_scaler == "none" and kind != "none":
-        on_root("pDDLES: [les] les_pddles_scaler = 'none' — feeding the "
+    if override == "none" and kind != "none":
+        on_root("pDDLES: [les] les_pddles_scaler = 'none' \u2014 feeding the "
                 "network raw, unnormalised velocity even though it was "
                 f"trained behind the {kind!r} scaler. Its input is out of "
                 "distribution; tau should not be trusted.")
@@ -291,43 +329,40 @@ def _resolve_scaler(torch, ckpt_args, state, device):
     if kind == "none":
         return None
 
-    # Stand-in for a norm.pt that is not available: standardise with the
-    # field's own per-component moments at every call. Loud, because it is not
-    # what the network was trained against -- the fitted constants are
-    # training-set statistics, while these follow the running solution.
-    if state.cfg.les_pddles_scaler == "auto":
-        on_root("pDDLES: [les] les_pddles_scaler = 'auto' — standardising "
+    # Stand-in for the fitted constants: standardise with the field's own
+    # per-component moments at every call. Loud, because it is not what the
+    # network was trained against -- the fitted constants are training-set
+    # statistics, while these follow the running solution.
+    if override == "auto":
+        on_root("pDDLES: [les] les_pddles_scaler = 'auto' \u2014 standardising "
                 "with the field's own moments instead of the fitted "
-                f"{kind!r} constants. Diagnostic use only; load the real "
-                "norm.pt for production runs.")
+                f"{kind!r} constants the network was trained behind. "
+                "Diagnostic use only.")
         return _AUTO_SCALER
 
-    fname = {"norm": "norm.pt", "minmax": "minmax.pt"}.get(kind)
-    if fname is None:
-        raise ValueError(f"pDDLES: unsupported scaler {kind!r} in checkpoint")
+    if override:
+        raise ValueError(
+            f"pDDLES: [les] les_pddles_scaler = {override!r} is not "
+            f"recognised. The normalisation constants now travel inside the "
+            f"checkpoint, so no path is read; leave it empty to use them, or "
+            f"set \"auto\" / \"none\" for a diagnostic run.")
 
-    path = state.cfg.les_pddles_scaler
-    if not path:
-        h5path = getattr(ckpt_args, "h5path", "") or ""
-        path = os.path.join(str(h5path), fname)
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"pDDLES: the checkpoint was trained with the {kind!r} scaler but "
-            f"its constants were not found at {path!r}. That file is written "
-            f"next to the training data, not into the checkpoint — copy it "
-            f"across and point [les] les_pddles_scaler at it. To run without "
-            f"it, set les_pddles_scaler to \"auto\" (standardise with the "
-            f"field's own moments) or \"none\" (no normalisation at all) — "
-            f"both diagnostic only.")
+    if "scaler" not in ckpt:
+        raise ValueError(
+            "pDDLES: this checkpoint carries no 'scaler' state. It predates "
+            "pDDLES embedding the normalisation constants in the checkpoint, "
+            "and the standalone norm.pt / minmax.pt files are no longer read. "
+            "Re-export it from a current pDDLES, or set [les] "
+            "les_pddles_scaler to \"auto\" / \"none\" for a diagnostic run.")
 
-    blob = torch.load(path, map_location=device, weights_only=False)
-    vals = blob["vals"]
-    if kind == "norm":
-        # stack of X_mean, X_std, y_mean, y_std, each shaped (1, 3, 1, 1, 1).
-        return tuple(vals[i].to(device) for i in range(4))
-    # minmax stores four scalars; recast to the same (bias, range) algebra.
-    x_min, x_max, y_min, y_max = (vals[i].to(device) for i in range(4))
-    return (x_min, x_max - x_min, y_min, y_max - y_min)
+    scaler = _scaler_from_state(torch, ckpt["scaler"], device)
+    if scaler is None:
+        on_root("pDDLES: checkpoint carries an empty scaler state (trained "
+                "without normalisation); none applied.")
+    else:
+        on_root(f"pDDLES: {kind!r} normalisation constants read from the "
+                f"checkpoint.")
+    return scaler
 
 
 def _backfill_args(args, torch) -> None:
@@ -437,7 +472,7 @@ def _load_predictor(state: State) -> _Predictor:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    predictor = _Predictor(model, _resolve_scaler(torch, args, state, device),
+    predictor = _Predictor(model, _resolve_scaler(torch, ckpt, state, device),
                            args, device)
     state._sgs_predictor = predictor
     return predictor
