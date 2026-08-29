@@ -463,10 +463,24 @@ def _load_predictor(state: State) -> _Predictor:
     try:
         arch = importlib.import_module(f"lib.arch.{args.arch}")
     except ImportError as exc:
+        # ModuleNotFoundError subclasses ImportError, so a third-party import
+        # missing *inside* the architecture module lands here too. Blaming
+        # les_pddles_source for that sends the reader to fix a path that is
+        # already correct, so separate the two cases.
+        modfile = os.path.join(src, "lib", "arch", f"{args.arch}.py")
+        missing = getattr(exc, "name", None) or ""
+        if src and os.path.exists(modfile) and not missing.startswith("lib"):
+            raise ImportError(
+                f"pDDLES: found {modfile} but could not import it — it needs "
+                f"{missing!r}, which is not installed in this environment. "
+                f"That is a dependency of the pDDLES architecture, not of "
+                f"ALIAKMON; install it into this interpreter "
+                f"(pip install {missing}).") from exc
         raise ImportError(
             f"pDDLES: cannot import lib.arch.{args.arch}; point [les] "
             f"les_pddles_source at a checkout of the pDDLES source tree "
-            f"(currently {src!r})") from exc
+            f"(currently {src!r}). It must be the tree ROOT — the directory "
+            f"containing lib/ — not lib/arch itself.") from exc
 
     model = arch.get_model(args).to(device)
     model.load_state_dict(ckpt["model"])

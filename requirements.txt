@@ -17,3 +17,9 @@ tomli>=2.0 ; python_version < "3.11"
 # which runs a trained TorchScript predictor. Left out of the default install
 # because it is a large dependency the DNS and eddy-viscosity paths never touch.
 #   pip install torch
+#
+# The architecture modules are imported from the pDDLES tree itself
+# (les_pddles_source), so they bring their own requirements: lib/arch/WNet.py
+# needs the wavelet packages, while FNet/ResNet do not. Install only for the
+# architectures you actually load:
+#   pip install PyWavelets ptwt      # WNet
