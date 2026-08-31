@@ -24,7 +24,8 @@ numpy + mpi4py-fft (distributed slab/pencil real FFTs) + Numba
 - `kernels.py` — Numba kernels (cross product, curl, projection, viscous,
   RK substage, max-norm); verified vs numpy references
 - `transforms.py` — `Transforms`: PFFT wrapper, local wavenumbers, coords
-- `data.py` — `State`: fields, mask (3 truncation criteria), phase factors
+- `data.py` — `State`: fields, mask (3 truncation criteria; an LES run
+  overrides the configured one — see the LES bullet), phase factors
 - `numerics.py` — RHS (rotational form), RK2/RK4, projection, CFL, diagnostics
   (+ kinetic helicity, shell energy spectrum, integral length scale,
   `setup_viscosity` Re/eta/nu from aliakmon.f90:163-185)
@@ -121,6 +122,17 @@ Two interop gotchas:
   - `Config.les_active` / `Config.diffusive`: the diffusion term and the
     dissipation diagnostics key off `diffusive`, so `viscous=false` + LES
     (pure eddy viscosity, no molecular part) still works.
+  - **The numerical cutoff IS the LES cutoff.** Any LES model (functional or
+    structural) makes `State._setup_mask` truncate *spherically* at `k_c`,
+    whatever `[numerics] truncation` says — `data.State._effective_truncation`
+    announces the override on root. A subgrid model is defined behind a sharp
+    spectral filter, i.e. for a field holding every mode inside a sphere of
+    radius `k_c` and nothing outside; the two-thirds (box) and polyhedral
+    boundaries are neither, and a truncation *above* `k_c` leaves modes the
+    model does not close. The test is inclusive (`|k| <= k_c`), matching
+    `sgs._filter_mask` and pDDLES's own training filter. `k_c` comes from
+    `sgs.les_cutoff`: `les_kc`, else pDDLES's alpha, else `kmax` (which for
+    Chollet-Lesieur with `les_kc=0` reproduces the plain spherical mask).
   Enable with `[les] les_model=1 les_ck=1.4 les_kc=0.0` (`les_kc=0` -> the
   truncation `kmax`). Validated at n=32, Re_lambda=300 (kmax*eta=0.05, far too
   coarse for DNS): nu_t saturates near 10x nu_mol on the plateau and 28x at the
@@ -197,7 +209,11 @@ Two interop gotchas:
     cycles/sample (`torch.fft.fftfreq`), where the grid corner is `sqrt(3)/2`
     and `_les_filter_mask` keeps `|k|/n <= alpha*sqrt(3)/2`; in this solver's
     integer wavenumbers that is `k_c = alpha * sqrt(3)/2 * n`. Setting
-    `les_kc` overrides it, which is usually a mistake.
+    `les_kc` overrides it, which is usually a mistake. The solver truncates
+    there too, so the evolved band is exactly the net's training band; that is
+    why `State` loads the checkpoint (via `sgs.les_cutoff`) while it is still
+    building the mask, which also makes a bad checkpoint fail before the
+    banner rather than after the first output frame.
   - The net is resolution-specific (spectral coefficients indexed by a fixed
     wavenumber grid), so the run's `n` must equal the checkpoint's; enforced.
   torch is an optional dependency; nothing else in the port imports it.
@@ -208,12 +224,14 @@ Two interop gotchas:
   8 blocks, n=32, alpha=0.1, scaler='norm').
   - `alpha=0.1` => `k_c = alpha*sqrt(3)/2*n = 2.7713`, so the resolved band is
     only shells 0,1,2 (`k_max_active=2.449`, **51 modes** on the 32^3 grid).
-    `[numerics] truncation_kc = 2.7713` evolves exactly that band, which is
-    what the net was trained to receive; without it the net gets input with
-    energy where training inputs were identically zero (a warning fires).
-  - `truncation_kc` masks only — `state.kmax` stays at the scheme's nominal
-    15.085, because that is the grid's resolving power and is what sets nu in
-    `setup_viscosity` and the `kmax*eta` diagnostic. Do NOT collapse the two.
+    That band is now what the solver evolves automatically (the truncation is
+    the sphere `|k| <= k_c`); `[numerics] truncation_kc`, which this run used
+    to need set by hand, is left for cutting *below* `k_c`.
+  - The mask alone moves — `state.kmax` stays at the scheme's nominal 15.085,
+    because that is the grid's resolving power and is what sets nu in
+    `setup_viscosity` and the `kmax*eta` diagnostic. Do NOT collapse the two:
+    the banner's `kmax` and `k_max(active)` are different numbers on purpose,
+    and it is `k_max(active)` that equals `k_c`.
   - Old checkpoints predate `precision`/`torch_dtype` in `pDDLES.py:main`;
     `sgs._backfill_args` re-derives the missing Namespace fields (never
     overriding what a checkpoint carries).
@@ -286,8 +304,11 @@ compression on HDF5, collective parallel HDF5 (currently gather-to-root).
    once keyed off `cfg.les_kc` alone, so the alpha-derived `k_c` was computed,
    broadcast and printed in the progress box while the filter silently stayed
    at the full truncation — correct-looking banner, wrong tau, `eps_sgs` at
-   round-off. Regression test: a derived `k_c` must keep strictly fewer modes
-   than `state.mask`.
+   round-off. The regression test used to be "a derived `k_c` keeps strictly
+   fewer modes than `state.mask`"; that is now INVERTED, because the solver
+   truncates at `k_c` as well, so `_filter_mask == state.mask` is the correct
+   outcome. Test instead that both equal the sphere `|k| <= k_c`, i.e. that
+   `k_max_active <= k_c` while `kmax` stays at the scheme's nominal value.
 8. Stochastic IC spectra (initial_conditions.py): Fortran `random_field(kmax)`
    is a FLAT spectrum with a hard cutoff |k|<kmax AND only modes with all three
    wavenumber components nonzero (so kmax=2 → only the (+-1,+-1,+-1) modes, a

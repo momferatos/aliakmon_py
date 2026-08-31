@@ -6,6 +6,10 @@ active-mode mask with its three truncation criteria (``twothirds_tr``,
 ``spherical_tr``, ``polyhedral_tr``) and the Patterson-Orszag phase-shift
 factor used for dealiasing (``make_phases_array``).
 
+One departure from the Fortran: an LES run always truncates spherically, at
+the subgrid model's own cutoff ``k_c``, so that the numerical cutoff and the
+LES cutoff are the same wavenumber. See :meth:`State._effective_truncation`.
+
 Each field is stored as a list of three component arrays (one per velocity
 component) so the Numba kernels receive plain contiguous arrays.
 """
@@ -16,7 +20,7 @@ import math
 
 import numpy as np
 
-from .backend import allreduce_max, allreduce_sum
+from .backend import allreduce_max, allreduce_sum, on_root
 from .parameters import NFIELDS, PI, Config, Truncation
 from .transforms import Transforms
 
@@ -139,19 +143,50 @@ class State:
     # ------------------------------------------------------------------
     # Active-mode mask (alloc_init loop + *_tr criteria in data.f90)
     # ------------------------------------------------------------------
+    def _effective_truncation(self) -> Truncation:
+        """The truncation scheme actually used; an LES run overrides the config.
+
+        A subgrid model closes the equations behind a *sharp spectral filter*:
+        it is defined for a field carrying every mode inside a sphere of radius
+        ``k_c`` and nothing outside it. Neither the two-thirds mask (a box) nor
+        the polyhedral one is such a sphere, so with an LES model on, the
+        truncation is spherical whatever ``[numerics] truncation`` asks for.
+        """
+        cfg = self.cfg
+        if not cfg.les_active or cfg.truncation == Truncation.SPHERICAL:
+            return cfg.truncation
+        on_root(f"LES {cfg.les_model.name}: [numerics] truncation = "
+                f"{cfg.truncation.name} overridden with SPHERICAL — the "
+                f"subgrid model is defined behind a sharp spectral filter, so "
+                f"the resolved band must be the sphere |k| <= k_c.")
+        return Truncation.SPHERICAL
+
     def _setup_mask(self) -> None:
         n = self.n
         akx, aky, akz = np.abs(self.KX), np.abs(self.KY), np.abs(self.KZ)
-        trunc = self.cfg.truncation
+        trunc = self.truncation = self._effective_truncation()
 
         if trunc == Truncation.TWO_THIRDS:
             kcut = n // 3
             truncated = (akx > kcut) | (aky > kcut) | (akz > kcut)
             self.kmax = n // 3
         elif trunc == Truncation.SPHERICAL:
-            kmax = TRFAC * n
-            truncated = np.sqrt(self.K2) >= kmax
-            self.kmax = kmax
+            # Nominal radius first: it is the grid's resolving power, and an
+            # LES cutoff that falls back on it needs it already set.
+            self.kmax = TRFAC * n
+            kabs = np.sqrt(self.K2)
+            if self.cfg.les_active:
+                # Numerical cutoff == LES cutoff. The solver then evolves
+                # exactly the band the subgrid model closes: no mode above
+                # k_c, which the model does not represent and (for a trained
+                # one) never saw carrying energy, and no mode below it
+                # discarded. Imported here because sgs imports this module.
+                from . import sgs as SGS
+                # Inclusive, |k| <= k_c: this is the band the sharp filter in
+                # sgs keeps, and the one pDDLES trained against.
+                truncated = kabs > SGS.les_cutoff(self)
+            else:
+                truncated = kabs >= self.kmax
         elif trunc == Truncation.POLYHEDRAL:
             half = n // 2
             twothirds = (2 * n) // 3
@@ -165,10 +200,9 @@ class State:
             raise ValueError(f"unknown truncation {trunc!r}")
 
         # Optional explicit spectral cutoff, applied on top of the scheme's
-        # own limit. An LES closed by a subgrid model that was *trained* at a
-        # particular filter width has to evolve exactly that band, or the
-        # model sees fields unlike anything in its training set; the stock
-        # schemes are all tied to n and cannot express an arbitrary k_c.
+        # own limit — for cutting the resolved band by hand in a DNS run, or
+        # *below* k_c in an LES one. An LES needs nothing here to match its
+        # model's filter: the spherical branch above already truncates at k_c.
         #
         # `self.kmax` is deliberately left at the scheme's nominal value: it
         # stands for the grid's resolving power, which is what sets the

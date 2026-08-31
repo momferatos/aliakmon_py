@@ -74,7 +74,11 @@ Three things follow, and each is a way to get silently wrong answers:
 * **The filter must match training.** ``k_c`` is derived from the checkpoint's
   ``alpha`` as ``alpha * sqrt(3)/2 * n``, so ``tau`` is built with the filter
   the network was trained against. Setting ``les_kc`` overrides this, which is
-  usually a mistake.
+  usually a mistake. The solver's own truncation is matched to ``k_c`` as well
+  (:meth:`data.State._setup_mask`): an LES run is truncated spherically at the
+  model's cutoff, so the evolved band is exactly the one the network was
+  trained to receive — never one carrying energy where its training inputs
+  were identically zero.
 
 The network itself takes the physical-space velocity as float32
 ``(1, 3, N, N, N)`` with axes ``[batch, component, ix, iy, iz]`` on the
@@ -131,7 +135,8 @@ def _sync_cutoff(state: State) -> None:
 
     Only the root rank holds the network, so the derived cutoff is broadcast:
     every rank must build the same filter mask. Must run before
-    :func:`_filter_mask` caches anything.
+    :func:`_filter_mask` caches anything — and before the truncation mask is
+    built, since that is sized by ``k_c`` too (:func:`les_cutoff`).
     """
     if state.cfg.les_kc > 0.0 or getattr(state, "_sgs_kc", None) is not None:
         return
@@ -144,17 +149,22 @@ def _sync_cutoff(state: State) -> None:
         kc = COMM.bcast(kc, root=0)
     state._sgs_kc = kc
 
-    # The network was trained on inputs that were identically zero above k_c.
-    # If the solver's resolved band reaches past it, every step hands the net
-    # energy at wavenumbers it only ever saw empty, and tau there is not
-    # meaningfully predicted. Set [numerics] truncation_kc to match.
-    if state.k_max_active > kc * (1.0 + 1.0e-9):
-        on_root(
-            f"pDDLES WARNING: the solver resolves up to |k| = "
-            f"{state.k_max_active:.3f} but the network was trained with the "
-            f"LES filter at k_c = {kc:.3f}. Its input is out of distribution "
-            f"above k_c. Set [numerics] truncation_kc = {kc:.4f} to evolve "
-            f"the band the model was trained for.")
+
+def les_cutoff(state: State) -> float:
+    """The LES cutoff to truncate the solver at, resolved as early as possible.
+
+    The same value as :func:`cutoff_wavenumber`, except that it first pulls the
+    pDDLES cutoff out of the checkpoint. :meth:`data.State._setup_mask` needs
+    ``k_c`` to size the truncation sphere, which happens while the state is
+    still being built — long before the first stress is formed, where
+    :func:`subgrid_stress` would otherwise be the one to fix the cutoff.
+
+    Loading the predictor here is what makes the run fail fast on a missing or
+    mismatched checkpoint, rather than after the first output frame.
+    """
+    if state.cfg.les_tensor:
+        _sync_cutoff(state)
+    return cutoff_wavenumber(state)
 
 
 def filter_width(state: State) -> float:
@@ -166,8 +176,10 @@ def filter_width(state: State) -> float:
 def _filter_mask(state: State) -> np.ndarray:
     """Sharp spectral filter ``G(k) = 1`` for ``|k| <= k_c``, cached on state.
 
-    When ``les_kc`` is unset this is exactly the solver's truncation mask, so
-    the same array is reused rather than rebuilt.
+    Since the solver truncates at ``k_c`` too, this normally coincides with
+    the truncation mask; it is still built as a sphere rather than aliased to
+    ``state.mask``, so that a ``truncation_kc`` cutting *below* ``k_c`` (or a
+    scheme whose boundary is not a sphere) still gets the filter it asks for.
     """
     g = getattr(state, "_sgs_filter", None)
     if g is None:

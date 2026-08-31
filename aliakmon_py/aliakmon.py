@@ -46,14 +46,12 @@ def _banner(state: State, info: dict) -> None:
     print(f"| eta {info['eta']:10.3e} | kmax*eta {state.kmax * info['eta']:7.3f}"
           f" | lambda {info['lambda_target']:10.3e}")
     print(f"| IC {cfg.initcond.name} | integration {cfg.integration_method.name}"
-          f" | truncation {cfg.truncation.name}")
+          f" | truncation {state.truncation.name}")
     if cfg.les_tensor:
-        # k_c normally comes from the checkpoint's alpha, which is only read
-        # once the predictor loads (after this banner) — so say where it will
-        # come from rather than printing a placeholder.
-        kc = (f"{cfg.les_kc:8.3f}" if cfg.les_kc > 0.0
-              else "from checkpoint alpha")
-        print(f"| LES {cfg.les_model.name} | k_c {kc}"
+        # k_c is known by now even when it comes from the checkpoint's alpha:
+        # the truncation sphere is built at k_c, so State loaded the predictor.
+        print(f"| LES {cfg.les_model.name} "
+              f"| k_c {SGS.cutoff_wavenumber(state):8.3f}"
               f" | clip {str(cfg.les_clip_backscatter).lower()}")
         print(f"| predictor {cfg.les_pddles_model or '<unset>'}"
               f" | device {cfg.les_pddles_device}")
