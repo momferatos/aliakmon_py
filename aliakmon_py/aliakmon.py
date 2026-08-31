@@ -148,20 +148,10 @@ def main(config_path: str | Path = "config.toml") -> None:
 
     if cfg.outputfiles:
         hdf5_io.write_field(state, time, 888888)
-    _write_spectrum(state)
+    hdf5_io.write_spectrum(state, time, "espec.final.dat")
 
     on_root(f"Done. {k - 1} steps, t = {time:.4f}, "
             f"elapsed {progress.elapsed():.2f}s.")
-
-
-def _write_spectrum(state: State, fname: str = "espec.final.dat") -> None:
-    """Write the final kinetic-energy spectrum E(k) (output_spectra)."""
-    k, e = N.energy_spectrum(state)
-    if not IS_ROOT:
-        return
-    with open(fname, "w") as fh:
-        for ki, ei in zip(k, e):
-            fh.write(f"{ki:30.14e} {ei:30.14e}\n")
 
 
 if __name__ == "__main__":
