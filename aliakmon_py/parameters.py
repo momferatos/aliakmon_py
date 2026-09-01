@@ -142,7 +142,10 @@ class Config:
     # [les]
     les_model: LESModel = LESModel.NONE
     les_ck: float = 1.4
+    # The filter cutoff, either as the wavenumber itself or as the fraction of
+    # the grid corner that pDDLES's `alpha` also measures (see sgs).
     les_kc: float = 0.0
+    les_alpha: float = 0.0
     # pDDLES only; ignored by the eddy-viscosity models.
     les_pddles_model: str = ""
     les_pddles_source: str = ""

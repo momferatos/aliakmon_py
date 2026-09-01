@@ -131,10 +131,24 @@ Two interop gotchas:
     boundaries are neither, and a truncation *above* `k_c` leaves modes the
     model does not close. The test is inclusive (`|k| <= k_c`), matching
     `sgs._filter_mask` and pDDLES's own training filter. `k_c` comes from
-    `sgs.les_cutoff`: `les_kc`, else pDDLES's alpha, else `kmax` (which for
-    Chollet-Lesieur with `les_kc=0` reproduces the plain spherical mask).
-  Enable with `[les] les_model=1 les_ck=1.4 les_kc=0.0` (`les_kc=0` -> the
-  truncation `kmax`). Validated at n=32, Re_lambda=300 (kmax*eta=0.05, far too
+    `sgs.les_cutoff`: `les_kc`, else `les_alpha`, else pDDLES's alpha, else
+    `kmax` (which for a bare `les_model=1` reproduces the plain spherical mask).
+  - **`les_alpha` names the cutoff as a fraction, on pDDLES's basis.**
+    `k_c = les_alpha * sqrt(3)/2 * n` (`sgs.alpha_cutoff`), the grid CORNER as
+    in `TurbDataset._les_filter_mask` — *not* the solver's
+    `kmax = sqrt(2)/3 * n`. So `les_alpha = 0.1` and a checkpoint trained at
+    `alpha = 0.1` are the same filter at the same `n` (verified: both give
+    `k_c = 5.5426` and the same 418 modes at n=64), which is what makes a
+    Chollet-Lesieur run comparable with a pDDLES one. Consequences of that
+    choice: the usable range stops at `(sqrt(2)/3)/(sqrt(3)/2) = 0.5443`, where
+    `k_c = kmax`; and `les_alpha = 0` means `kmax`, not zero. `les_cutoff` is
+    the single choke point every cutoff passes through, so it rejects
+    `les_kc` + `les_alpha` together (two names for one thing), `les_alpha` with
+    pDDLES (whose alpha rides in the checkpoint), and any `k_c > kmax` — that
+    last one guards the truncation change above, since the solver now truncates
+    at `k_c` and would otherwise evolve modes past the dealiasing limit.
+  Enable with `[les] les_model=1 les_ck=1.4 les_alpha=0.25`. Validated at
+  n=32, Re_lambda=300 (kmax*eta=0.05, far too
   coarse for DNS): nu_t saturates near 10x nu_mol on the plateau and 28x at the
   cusp, and the energy budget closes to 0.1-0.3%. Expect a transient few-%
   budget residual while nu_t first ramps up — that is the O(dt) cost of

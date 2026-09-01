@@ -25,10 +25,20 @@ kforcing = 2.5           # maximum forced wavenumber
 les_model = 0            # 0: none (DNS), 1: Chollet-Lesieur eddy viscosity,
                         # 2: pDDLES (predicted-field subgrid stress tensor)
 les_ck = 1.4             # Kolmogorov constant; 1.4 gives the classic 0.267 plateau
-les_kc = 0.0             # cutoff wavenumber k_c; 0 -> the truncation k_max
-                        # (pDDLES: the checkpoint's alpha). Whatever k_c ends
-                        # up being, the solver truncates there: an LES run is
-                        # spherically truncated at exactly the LES cutoff.
+# The filter cutoff k_c, named either way; set at most one of the two. Whatever
+# k_c ends up being, the solver truncates there: an LES run is spherically
+# truncated at exactly the LES cutoff.
+les_kc = 0.0             # the cutoff wavenumber itself; 0 -> use les_alpha
+les_alpha = 0.0          # the cutoff as the fraction of the wavenumbers the
+                        # filter keeps: k_c = les_alpha * sqrt(3)/2 * n. Same
+                        # basis (the grid corner) as a pDDLES checkpoint's
+                        # alpha, so les_alpha = 0.1 here and a net trained at
+                        # alpha = 0.1 are the same filter. Usable up to 0.5443
+                        # = the dealiasing limit k_max; beyond that the run is
+                        # rejected. 0 -> k_max, i.e. close at the truncation.
+                        # Does not apply to pDDLES: that cutoff rides in the
+                        # checkpoint (les_kc still overrides it, usually a
+                        # mistake).
 # pDDLES only; see the checkpoint contract in aliakmon_py/sgs.py.
 # The .pth carries its own training args, so the architecture and the filter
 # cutoff alpha are read from it -- do NOT restate them here. Note les_kc above

@@ -106,24 +106,47 @@ from .parameters import PI, LESModel
 # ----------------------------------------------------------------------
 # Filter geometry
 # ----------------------------------------------------------------------
-# pDDLES measures wavenumbers in cycles/sample (torch.fft.fftfreq), where the
-# grid corner sits at sqrt(3)/2. Its LES filter keeps |k|/n <= alpha*sqrt(3)/2,
-# so in the integer-wavenumber units of this solver (box length 2*pi) the
-# cutoff is alpha * sqrt(3)/2 * n. See TurbDataset._les_filter_mask.
+# A cutoff is naturally quoted as the *fraction* of the wavenumbers a filter
+# keeps rather than as a wavenumber, since that fraction is what fixes how much
+# of the flow the model has to close, independently of n. pDDLES measures it in
+# cycles/sample (torch.fft.fftfreq), where the grid corner sits at sqrt(3)/2 and
+# its LES filter keeps |k|/n <= alpha*sqrt(3)/2 (TurbDataset._les_filter_mask),
+# so in the integer wavenumbers of this solver (box length 2*pi) the cutoff is
+# alpha * sqrt(3)/2 * n.
+#
+# `[les] les_alpha` is that same fraction, on the same basis, for the models
+# that are configured rather than trained: les_alpha = 0.1 and a checkpoint
+# trained at alpha = 0.1 are the same filter, which is what makes a
+# Chollet-Lesieur run comparable with a pDDLES one. Note the basis is the grid
+# CORNER, not the solver's kmax = sqrt(2)/3 * n, so the usable range stops at
+# (sqrt(2)/3)/(sqrt(3)/2) = 0.5443 -- alpha beyond that asks for a cutoff past
+# the dealiasing limit, which `les_cutoff` rejects.
 _GRID_KMAX_FACTOR = math.sqrt(3.0) / 2.0
+
+
+def alpha_cutoff(alpha: float, n: int) -> float:
+    """``k_c`` for a filter keeping the fraction ``alpha`` of the wavenumbers."""
+    return float(alpha) * _GRID_KMAX_FACTOR * int(n)
 
 
 def cutoff_wavenumber(state: State) -> float:
     """LES filter cutoff ``k_c``, in integer wavenumbers.
 
-    Precedence: an explicit ``les_kc``, else the value derived from the
-    checkpoint's ``alpha`` by :func:`_sync_cutoff`, else the truncation
-    ``kmax``. The middle case is the one that matters for pDDLES — tau has to
-    be built with the same filter the network was trained against.
+    Precedence, most explicit first:
+
+    * ``les_kc``, the cutoff wavenumber itself;
+    * ``les_alpha``, the cutoff as a fraction of the grid corner;
+    * the cutoff :func:`_sync_cutoff` derived from a pDDLES checkpoint's own
+      ``alpha`` — the same formula as ``les_alpha``, read from the network
+      instead of the config. This is the case that matters for pDDLES: tau has
+      to be built with the filter the network was trained against;
+    * the truncation ``kmax``, i.e. a model closing at the resolved limit.
     """
-    kc = float(state.cfg.les_kc)
-    if kc > 0.0:
-        return kc
+    cfg = state.cfg
+    if cfg.les_kc > 0.0:
+        return float(cfg.les_kc)
+    if cfg.les_alpha > 0.0:
+        return alpha_cutoff(cfg.les_alpha, state.n)
     derived = getattr(state, "_sgs_kc", None)
     if derived is not None:
         return float(derived)
@@ -143,7 +166,7 @@ def _sync_cutoff(state: State) -> None:
     kc = None
     if IS_ROOT:
         alpha = float(getattr(_load_predictor(state).args, "alpha", 0.0))
-        kc = (alpha * _GRID_KMAX_FACTOR * state.n if alpha > 0.0
+        kc = (alpha_cutoff(alpha, state.n) if alpha > 0.0
               else float(state.kmax))
     if SIZE > 1:
         kc = COMM.bcast(kc, root=0)
@@ -154,17 +177,48 @@ def les_cutoff(state: State) -> float:
     """The LES cutoff to truncate the solver at, resolved as early as possible.
 
     The same value as :func:`cutoff_wavenumber`, except that it first pulls the
-    pDDLES cutoff out of the checkpoint. :meth:`data.State._setup_mask` needs
-    ``k_c`` to size the truncation sphere, which happens while the state is
-    still being built — long before the first stress is formed, where
-    :func:`subgrid_stress` would otherwise be the one to fix the cutoff.
+    pDDLES cutoff out of the checkpoint and then checks that the run can
+    actually carry it. :meth:`data.State._setup_mask` needs ``k_c`` to size the
+    truncation sphere, which happens while the state is still being built —
+    long before the first stress is formed, where :func:`subgrid_stress` would
+    otherwise be the one to fix the cutoff.
 
     Loading the predictor here is what makes the run fail fast on a missing or
-    mismatched checkpoint, rather than after the first output frame.
+    mismatched checkpoint, rather than after the first output frame. Being the
+    one place every cutoff passes through, it is also where the ways of
+    *naming* one are checked against each other.
     """
-    if state.cfg.les_tensor:
+    cfg = state.cfg
+    if cfg.les_kc > 0.0 and cfg.les_alpha > 0.0:
+        raise ValueError(
+            f"[les] les_kc = {cfg.les_kc} and les_alpha = {cfg.les_alpha} are "
+            f"two ways of naming the same cutoff (les_alpha means k_c = "
+            f"{alpha_cutoff(cfg.les_alpha, state.n):.4f} at n = {state.n}). "
+            f"Set one of them, not both.")
+    if cfg.les_model == LESModel.PDDLES and cfg.les_alpha > 0.0:
+        raise ValueError(
+            "[les] les_alpha does not apply to pDDLES: its cutoff is the alpha "
+            "the network was TRAINED behind, and it travels in the checkpoint. "
+            "Leave les_alpha at 0. (les_kc still overrides it, which is usually "
+            "a mistake.)")
+
+    if cfg.les_tensor:
         _sync_cutoff(state)
-    return cutoff_wavenumber(state)
+    kc = cutoff_wavenumber(state)
+
+    # The solver truncates at k_c, so a cutoff above the dealiasing limit does
+    # not buy resolution — it keeps modes whose nonlinear products fold back
+    # into the resolved band. Neither Patterson-Orszag nor the truncation can
+    # remove that once the modes are being evolved.
+    if kc > state.kmax * (1.0 + 1.0e-9):
+        raise ValueError(
+            f"LES cutoff k_c = {kc:.4f} is past this grid's dealiasing limit "
+            f"kmax = {state.kmax:.4f} (n = {state.n}), so the resolved band "
+            f"would alias. Either raise [general] n to "
+            f"{math.ceil(kc * state.n / state.kmax)} or more, or lower the "
+            f"cutoff (les_alpha <= "
+            f"{state.kmax / (_GRID_KMAX_FACTOR * state.n):.4f}).")
+    return kc
 
 
 def filter_width(state: State) -> float:
@@ -189,7 +243,7 @@ def _filter_mask(state: State) -> np.ndarray:
         # filtered at the truncation instead. Without any k_c, "filter at the
         # truncation" means the solver's own mask, whose polyhedral boundary
         # is not a sphere and so cannot be expressed as a |k| <= k_c test.
-        has_kc = (state.cfg.les_kc > 0.0
+        has_kc = (state.cfg.les_kc > 0.0 or state.cfg.les_alpha > 0.0
                   or getattr(state, "_sgs_kc", None) is not None)
         if has_kc:
             g = (np.sqrt(state.K2) <= cutoff_wavenumber(state)) & state.mask
