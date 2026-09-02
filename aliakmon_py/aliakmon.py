@@ -36,7 +36,7 @@ def _banner(state: State, info: dict) -> None:
         return
     cfg = state.cfg
     print("=" * 72)
-    print(" ALIAKMON_py — pseudo-spectral incompressible DNS (hydro)")
+    print(" ALIAKMON_py — pseudo-spectral incompressible DNS/LES (hydro)")
     print(f" backend: {backend_name()}")
     print("=" * 72)
     print(f"| N {cfg.n:5d} | kmax {state.kmax:8.3f} | k_max(active) "
